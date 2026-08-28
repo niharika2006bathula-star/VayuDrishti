@@ -1705,3 +1705,170 @@ def predict_pm25(payload: PredictRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, reload=True)
+
+
+class PollutionSourceItem(BaseModel):
+    name: str
+    type: str
+    distance_km: float
+
+class NearbySourcesResponse(BaseModel):
+    station: str
+    sources: List[PollutionSourceItem]
+    message: Optional[str] = None
+
+_OVERPASS_CACHE = {}
+_OVERPASS_CACHE_TTL = 3600
+
+@app.get("/nearby-sources/{station_name}", response_model=NearbySourcesResponse, summary="Get nearby industrial sources from OpenStreetMap")
+def get_nearby_sources(station_name: str):
+    coords_map = get_station_coordinates_map()
+    decoded_name = urllib.parse.unquote(station_name).strip()
+    
+    # Try to find exactly, or fallback to partial match
+    target = None
+    for name, coords in coords_map.items():
+        if name.lower() == decoded_name.lower():
+            target = {"name": name, "coords": coords}
+            break
+    
+    if not target:
+        for name, coords in coords_map.items():
+            if decoded_name.lower() in name.lower():
+                target = {"name": name, "coords": coords}
+                break
+                
+    if not target:
+        raise HTTPException(status_code=404, detail="Station coordinates not found.")
+        
+    lat = target["coords"]["latitude"]
+    lon = target["coords"]["longitude"]
+    
+    cache_key = f"{lat},{lon}"
+    import time
+    now = time.time()
+    
+    if cache_key in _OVERPASS_CACHE:
+        cached_data, timestamp = _OVERPASS_CACHE[cache_key]
+        if now - timestamp < _OVERPASS_CACHE_TTL:
+            return NearbySourcesResponse(station=target["name"], sources=cached_data)
+            
+    # Query Overpass
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node["power"="plant"](around:7000,{lat},{lon});
+      way["power"="plant"](around:7000,{lat},{lon});
+      relation["power"="plant"](around:7000,{lat},{lon});
+      node["man_made"="works"](around:7000,{lat},{lon});
+      way["man_made"="works"](around:7000,{lat},{lon});
+      relation["man_made"="works"](around:7000,{lat},{lon});
+      node["man_made"="chimney"](around:7000,{lat},{lon});
+      way["man_made"="chimney"](around:7000,{lat},{lon});
+      relation["man_made"="chimney"](around:7000,{lat},{lon});
+      node["industrial"="brick_yard"](around:7000,{lat},{lon});
+      way["industrial"="brick_yard"](around:7000,{lat},{lon});
+      relation["industrial"="brick_yard"](around:7000,{lat},{lon});
+      node["craft"="brickmaker"](around:7000,{lat},{lon});
+      way["craft"="brickmaker"](around:7000,{lat},{lon});
+      relation["craft"="brickmaker"](around:7000,{lat},{lon});
+      node["landuse"="quarry"](around:7000,{lat},{lon});
+      way["landuse"="quarry"](around:7000,{lat},{lon});
+      relation["landuse"="quarry"](around:7000,{lat},{lon});
+      node["industrial"="chemical"](around:7000,{lat},{lon});
+      way["industrial"="chemical"](around:7000,{lat},{lon});
+      relation["industrial"="chemical"](around:7000,{lat},{lon});
+      node["industrial"="steel"](around:7000,{lat},{lon});
+      way["industrial"="steel"](around:7000,{lat},{lon});
+      relation["industrial"="steel"](around:7000,{lat},{lon});
+      node["industrial"="cement"](around:7000,{lat},{lon});
+      way["industrial"="cement"](around:7000,{lat},{lon});
+      relation["industrial"="cement"](around:7000,{lat},{lon});
+    );
+    out center;
+    """
+    
+    try:
+        import requests
+        headers = {'User-Agent': 'VayuDrishti/1.0 (Delhi Air Quality App)'}
+        resp = requests.get(overpass_url, params={'data': query}, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        sources = []
+        for element in data.get("elements", []):
+            tags = element.get("tags", {})
+            
+            # Exclusion logic (Safety net)
+            if tags.get("man_made") in ["communications_tower", "tower"]:
+                continue
+            if "office" in tags:
+                continue
+            if tags.get("landuse") in ["commercial", "retail"]:
+                continue
+                
+            name = tags.get("name", tags.get("operator", "Unnamed industrial area"))
+            
+            # Name exclusion for telecom/broadcasting
+            lower_name = name.lower()
+            exclude_words = ["radio", "transmitter", "broadcast", "tower", "telecom", "antenna"]
+            if any(w in lower_name for w in exclude_words):
+                continue
+            
+            # Determine type based on refined query
+            source_type = "Industrial Area"
+            if tags.get("power") == "plant":
+                source_type = "Power Plant"
+            elif tags.get("man_made") == "works":
+                source_type = "Factory/Works"
+            elif tags.get("man_made") == "chimney":
+                source_type = "Industrial Chimney"
+            elif tags.get("industrial") == "brick_yard" or tags.get("craft") == "brickmaker":
+                source_type = "Brick Kiln"
+            elif tags.get("landuse") == "quarry":
+                source_type = "Quarry"
+            elif tags.get("industrial") in ["chemical", "steel", "cement"]:
+                source_type = f"{tags.get('industrial').capitalize()} Plant"
+            
+            # Get coords
+            elat = element.get("lat", element.get("center", {}).get("lat"))
+            elon = element.get("lon", element.get("center", {}).get("lon"))
+            
+            if elat and elon:
+                import math
+                def haversine(lat1, lon1, lat2, lon2):
+                    R = 6371.0
+                    dLat = math.radians(lat2 - lat1)
+                    dLon = math.radians(lon2 - lon1)
+                    a = math.sin(dLat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dLon / 2)**2
+                    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                    return R * c
+                    
+                dist = haversine(lat, lon, elat, elon)
+                sources.append(PollutionSourceItem(name=name, type=source_type, distance_km=round(dist, 1)))
+        
+        unique_sources = {}
+        for s in sources:
+            key = f"{s.name}_{s.type}"
+            if key not in unique_sources or s.distance_km < unique_sources[key].distance_km:
+                unique_sources[key] = s
+                
+        sorted_sources = sorted(unique_sources.values(), key=lambda x: x.distance_km)[:5]
+        
+        _OVERPASS_CACHE[cache_key] = (sorted_sources, now)
+        
+        msg = None
+        if not sorted_sources:
+            msg = "No tagged industrial sources found within 7km."
+            
+        return NearbySourcesResponse(station=target["name"], sources=sorted_sources, message=msg)
+        
+    except Exception as e:
+        print(f"Overpass API error: {e}")
+        return NearbySourcesResponse(
+            station=target["name"], 
+            sources=[], 
+            message="Could not fetch nearby sources at this time."
+        )
+

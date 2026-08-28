@@ -40,7 +40,8 @@ import {
   Navigation,
   Compass,
   Briefcase,
-  ShieldCheck
+  ShieldCheck,
+  Factory
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
@@ -156,8 +157,125 @@ function getPM25Theme(val) {
 }
 
 // Interactive Multi-Line Trend Chart (SVG)
+
+const useSvgZoomPan = (initialWidth, initialHeight) => {
+  const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: initialWidth, h: initialHeight });
+  const [isZoomed, setIsZoomed] = useState(false);
+  const [dragState, setDragState] = useState(null);
+  const svgRef = useRef(null);
+
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    
+    const handleWheel = (e) => {
+      e.preventDefault();
+      
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+      
+      const scale = e.deltaY > 0 ? 1.15 : 0.85;
+      
+      setViewBox(prev => {
+        let newW = prev.w * scale;
+        let newH = prev.h * scale;
+        
+        if (newW > initialWidth) {
+          newW = initialWidth;
+          newH = initialHeight;
+        }
+        
+        let newX = svgPt.x - (svgPt.x - prev.x) * scale;
+        let newY = svgPt.y - (svgPt.y - prev.y) * scale;
+        
+        if (newW >= initialWidth - 1) {
+          newX = 0;
+          newY = 0;
+          newW = initialWidth;
+          newH = initialHeight;
+        }
+        
+        setIsZoomed(newW < initialWidth - 1);
+        return { x: newX, y: newY, w: newW, h: newH };
+      });
+    };
+    
+    svg.addEventListener('wheel', handleWheel, { passive: false });
+    return () => svg.removeEventListener('wheel', handleWheel);
+  }, [initialWidth, initialHeight]);
+
+  const getSvgPoint = (e) => {
+    if (!svgRef.current) return { x: 0, y: 0 };
+    const pt = svgRef.current.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    return pt.matrixTransform(svgRef.current.getScreenCTM().inverse());
+  };
+
+  const handleMouseDown = (e) => {
+    const pt = getSvgPoint(e);
+    const mode = (e.shiftKey || isZoomed) ? 'pan' : 'zoom';
+    setDragState({ startX: pt.x, startY: pt.y, currentX: pt.x, currentY: pt.y, mode });
+  };
+
+  const handleMouseMove = (e) => {
+    if (!dragState) return;
+    const pt = getSvgPoint(e);
+    
+    if (dragState.mode === 'pan') {
+      const dx = pt.x - dragState.currentX;
+      const dy = pt.y - dragState.currentY;
+      setViewBox(prev => ({ ...prev, x: prev.x - dx, y: prev.y - dy }));
+      setDragState(prev => ({ ...prev, currentX: pt.x - dx, currentY: pt.y - dy }));
+    } else {
+      setDragState(prev => ({ ...prev, currentX: pt.x, currentY: pt.y }));
+    }
+  };
+
+  const handleMouseUp = () => {
+    if (!dragState) return;
+    if (dragState.mode === 'zoom') {
+      const minX = Math.min(dragState.startX, dragState.currentX);
+      const minY = Math.min(dragState.startY, dragState.currentY);
+      const w = Math.abs(dragState.currentX - dragState.startX);
+      const h = Math.abs(dragState.currentY - dragState.startY);
+      
+      if (w > 10 && h > 10) {
+        setViewBox({ x: minX, y: minY, w: w, h: h });
+        setIsZoomed(true);
+      }
+    }
+    setDragState(null);
+  };
+
+  const resetZoom = () => {
+    setViewBox({ x: 0, y: 0, w: initialWidth, h: initialHeight });
+    setIsZoomed(false);
+  };
+
+  return {
+    svgRef,
+    viewBoxStr: `${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`,
+    isZoomed,
+    dragState,
+    resetZoom,
+    getSvgPoint,
+    handlers: {
+      onMouseDown: handleMouseDown,
+      onMouseMove: handleMouseMove,
+      onMouseUp: handleMouseUp,
+      onMouseLeave: handleMouseUp,
+    }
+  };
+};
+
 function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onOpenModal }) {
   const [hoverIndex, setHoverIndex] = useState(null);
+  const width = 800;
+  const height = 210;
+  const zoomPan = useSvgZoomPan(width, height);
 
   if (!historyData || historyData.length === 0) {
     return (
@@ -168,8 +286,6 @@ function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onO
     );
   }
 
-  const width = 800;
-  const height = 210;
   const padLeft = 45;
   const padRight = 45;
   const padTop = 18;
@@ -253,25 +369,55 @@ function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onO
         </div>
       </div>
 
-      <div className="relative w-full overflow-hidden">
+      <div className="relative w-full overflow-hidden select-none">
+        {zoomPan.isZoomed && (
+          <button 
+            onClick={zoomPan.resetZoom}
+            className="absolute top-2 right-2 z-10 px-2 py-1 bg-slate-800/80 hover:bg-slate-700 text-xs text-white rounded border border-slate-600 backdrop-blur-sm shadow-lg flex items-center gap-1 transition-all"
+          >
+            <RefreshCw className="w-3 h-3" /> Reset Zoom
+          </button>
+        )}
         <svg 
-          viewBox={`0 0 ${width} ${height}`} 
-          className="w-full h-auto overflow-visible cursor-crosshair"
-          onMouseLeave={() => setHoverIndex(null)}>
+          ref={zoomPan.svgRef}
+          viewBox={zoomPan.viewBoxStr} 
+          className={`w-full h-auto overflow-visible ${zoomPan.isZoomed ? (zoomPan.dragState?.mode === 'pan' ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'}`}
+          onMouseDown={zoomPan.handlers.onMouseDown}
+          onMouseMove={(e) => {
+            zoomPan.handlers.onMouseMove(e);
+            if (!zoomPan.dragState) {
+              const svgPt = zoomPan.getSvgPoint(e);
+              if (svgPt.x >= padLeft && svgPt.x <= width - padRight) {
+                 const i = Math.round(((svgPt.x - padLeft) / innerWidth) * (historyData.length - 1));
+                 setHoverIndex(Math.max(0, Math.min(i, historyData.length - 1)));
+              } else {
+                 setHoverIndex(null);
+              }
+            }
+          }}
+          onMouseUp={zoomPan.handlers.onMouseUp}
+          onMouseLeave={(e) => {
+            zoomPan.handlers.onMouseLeave(e);
+            setHoverIndex(null);
+          }}>
           <defs>
             <linearGradient id="pmGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.20" />
               <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.0" />
             </linearGradient>
+            <clipPath id="chartClip">
+               <rect x={padLeft} y={0} width={innerWidth} height={height} />
+            </clipPath>
           </defs>
 
+          {/* Gridlines with 0.5px strokeWidth */}
           {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
             const y = padTop + innerHeight * ratio;
             const pmVal = Math.round(maxPm - ratio * (maxPm - minPm));
             const tempVal = (maxTemp - ratio * (maxTemp - minTemp)).toFixed(1);
             return (
               <g key={idx}>
-                <line x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="#1e293b" strokeDasharray="3 3" />
+                <line x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="#1e293b" strokeWidth="0.5" strokeDasharray="3 3" />
                 <text x={padLeft - 8} y={y + 3} fill="#64748b" fontSize="9" textAnchor="end" fontFamily="sans-serif">
                   {pmVal}
                 </text>
@@ -282,70 +428,58 @@ function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onO
             );
           })}
 
-          <path d={pmAreaPath} fill="url(#pmGradient)" />
-          <path d={tempPath} fill="none" stroke="#f43f5e" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          <path d={pmPath} fill="none" stroke="#06b6d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          <g clipPath="url(#chartClip)">
+            <path d={pmAreaPath} fill="url(#pmGradient)" />
+            {/* Trend lines with 1px strokeWidth */}
+            <path d={tempPath} fill="none" stroke="#f43f5e" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" />
+            <path d={pmPath} fill="none" stroke="#06b6d4" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" />
 
-          {historyData.map((d, i) => (
-            <rect
-              key={i}
-              x={getX(i) - (innerWidth / historyData.length) / 2}
-              y={padTop}
-              width={innerWidth / historyData.length}
-              height={innerHeight}
-              fill="transparent"
-              onMouseEnter={() => setHoverIndex(i)}
-            />
-          ))}
+            {/* Hover Indicator */}
+            {hoverIndex !== null && !zoomPan.dragState && (
+              <g>
+                <line 
+                  x1={getX(hoverIndex)} 
+                  y1={padTop} 
+                  x2={getX(hoverIndex)} 
+                  y2={padTop + innerHeight} 
+                  stroke="#334155" 
+                  strokeWidth="1"
+                  strokeDasharray="2 2" 
+                />
+                <circle cx={getX(hoverIndex)} cy={getYPm(historyData[hoverIndex].pm25)} r="3.5" fill="#06b6d4" stroke="#0F172A" strokeWidth="1.5" />
+                <circle cx={getX(hoverIndex)} cy={getYTemp(historyData[hoverIndex].temperature)} r="3.5" fill="#f43f5e" stroke="#0F172A" strokeWidth="1.5" />
+              </g>
+            )}
+          </g>
 
-          {hoverIndex !== null && (
-            <g>
-              <line
-                x1={getX(hoverIndex)}
-                y1={padTop}
-                x2={getX(hoverIndex)}
-                y2={padTop + innerHeight}
-                stroke="#94a3b8"
-                strokeWidth="1"
-                strokeDasharray="2 2"
-              />
-              <circle
-                cx={getX(hoverIndex)}
-                cy={getYPm(historyData[hoverIndex].pm25)}
-                r="3.5"
-                fill="#06b6d4"
-                stroke="#0f172a"
-                strokeWidth="1.5"
-              />
-              <circle
-                cx={getX(hoverIndex)}
-                cy={getYTemp(historyData[hoverIndex].temperature)}
-                r="3.5"
-                fill="#f43f5e"
-                stroke="#0f172a"
-                strokeWidth="1.5"
-              />
-            </g>
+          {/* Draw zoom selection box */}
+          {zoomPan.dragState && zoomPan.dragState.mode === 'zoom' && (
+             <rect 
+               x={Math.min(zoomPan.dragState.startX, zoomPan.dragState.currentX)}
+               y={Math.min(zoomPan.dragState.startY, zoomPan.dragState.currentY)}
+               width={Math.abs(zoomPan.dragState.currentX - zoomPan.dragState.startX)}
+               height={Math.abs(zoomPan.dragState.currentY - zoomPan.dragState.startY)}
+               fill="rgba(6, 182, 212, 0.15)"
+               stroke="#06b6d4"
+               strokeWidth="1"
+               strokeDasharray="4 4"
+             />
           )}
         </svg>
 
-        {hoveredPoint && (
-          <div 
-            style={{ 
-              left: `${Math.min(80, Math.max(10, (hoverIndex / (historyData.length - 1)) * 100))}%`,
-              top: '8px'
-            }}
-            className="absolute -translate-x-1/2 bg-slate-950/95 border border-slate-700 px-3 py-2 rounded-xl shadow-2xl pointer-events-none text-xs z-30 min-w-[140px]">
-            <div className="text-[10px] text-slate-400 font-medium border-b border-slate-800 pb-1 mb-1.5">
-              {new Date(hoveredPoint.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+        {hoveredPoint && !zoomPan.dragState && (
+          <div className="absolute top-2 left-[50%] -translate-x-[50%] bg-slate-800/90 border border-slate-700 p-2 rounded-lg text-[10px] shadow-lg backdrop-blur-md pointer-events-none flex gap-4 z-20">
+            <div>
+              <span className="text-slate-400 block mb-0.5">Time</span>
+              <span className="text-white font-medium">{new Date(hoveredPoint.timestamp).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
             </div>
-            <div className="flex items-center justify-between gap-3 text-cyan-300 font-bold">
-              <span>PM2.5:</span>
-              <span>{hoveredPoint.pm25} µg/m³</span>
+            <div>
+              <span className="text-slate-400 block mb-0.5">PM2.5</span>
+              <span className="text-cyan-400 font-bold">{hoveredPoint.pm25.toFixed(1)}</span>
             </div>
-            <div className="flex items-center justify-between gap-3 text-rose-400 font-bold mt-0.5">
-              <span>Temp:</span>
-              <span>{hoveredPoint.temperature} °C</span>
+            <div>
+              <span className="text-slate-400 block mb-0.5">Temp</span>
+              <span className="text-rose-400 font-bold">{hoveredPoint.temperature.toFixed(1)}°C</span>
             </div>
           </div>
         )}
@@ -354,12 +488,13 @@ function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onO
   );
 }
 
-
 // Interactive Scatter Plot for Global Model Accuracy
 function ModelScatterPlot({ data }) {
-  if (!data || data.length === 0) return null;
   const width = 800;
   const height = 300;
+  const zoomPan = useSvgZoomPan(width, height);
+
+  if (!data || data.length === 0) return null;
   const pad = 40;
   const innerW = width - pad * 2;
   const innerH = height - pad * 2;
@@ -380,11 +515,33 @@ function ModelScatterPlot({ data }) {
       <p className="text-[11px] text-slate-400 mb-4 leading-relaxed">
         Each point is one real prediction from the held-out test set (18,544 total). Points near the diagonal line are accurate; scatter increases at higher pollution levels, consistent with our documented model limitations.
       </p>
-      <div className="relative w-full overflow-hidden border border-slate-800/60 rounded-xl bg-slate-950/50 pt-2 pb-1 pr-4">
-        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible">
-          {/* Grid and Axes */}
-          <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#334155" strokeWidth="1"/>
-          <line x1={pad} y1={pad} x2={pad} y2={height - pad} stroke="#334155" strokeWidth="1"/>
+      <div className="relative w-full overflow-hidden border border-slate-800/60 rounded-xl bg-slate-950/50 pt-2 pb-1 pr-4 select-none">
+        {zoomPan.isZoomed && (
+          <button 
+            onClick={zoomPan.resetZoom}
+            className="absolute top-2 right-2 z-10 px-2 py-1 bg-slate-800/90 hover:bg-slate-700 text-xs text-white rounded border border-slate-600 backdrop-blur-sm shadow-lg flex items-center gap-1 transition-all"
+          >
+            <RefreshCw className="w-3 h-3" /> Reset Zoom
+          </button>
+        )}
+        <svg 
+          ref={zoomPan.svgRef}
+          viewBox={zoomPan.viewBoxStr} 
+          className={`w-full h-auto overflow-visible ${zoomPan.isZoomed ? (zoomPan.dragState?.mode === 'pan' ? 'cursor-grabbing' : 'cursor-grab') : 'cursor-crosshair'}`}
+          onMouseDown={zoomPan.handlers.onMouseDown}
+          onMouseMove={zoomPan.handlers.onMouseMove}
+          onMouseUp={zoomPan.handlers.onMouseUp}
+          onMouseLeave={zoomPan.handlers.onMouseLeave}>
+          
+          <defs>
+             <clipPath id="scatterClip">
+                <rect x={pad} y={0} width={innerW} height={height} />
+             </clipPath>
+          </defs>
+
+          {/* Grid and Axes (Stroke width 0.5px) */}
+          <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#334155" strokeWidth="0.5"/>
+          <line x1={pad} y1={pad} x2={pad} y2={height - pad} stroke="#334155" strokeWidth="0.5"/>
           
           {/* X and Y labels */}
           <text x={width / 2} y={height - 5} fill="#94a3b8" fontSize="12" textAnchor="middle" fontWeight="bold">Actual PM2.5 (µg/m³)</text>
@@ -393,42 +550,57 @@ function ModelScatterPlot({ data }) {
           {/* Axis Ticks (0, 100, 200, max) */}
           {[0, 100, 200, Math.floor(maxVal/100)*100].map(val => (
              <g key={`x-${val}`}>
-               <line x1={getX(val)} y1={height - pad} x2={getX(val)} y2={height - pad + 4} stroke="#64748b" />
+               <line x1={getX(val)} y1={height - pad} x2={getX(val)} y2={height - pad + 4} stroke="#64748b" strokeWidth="0.5" />
                <text x={getX(val)} y={height - pad + 14} fill="#64748b" fontSize="10" textAnchor="middle">{val}</text>
              </g>
           ))}
           {[100, 200, Math.floor(maxVal/100)*100].map(val => (
              <g key={`y-${val}`}>
-               <line x1={pad - 4} y1={getY(val)} x2={pad} y2={getY(val)} stroke="#64748b" />
+               <line x1={pad - 4} y1={getY(val)} x2={pad} y2={getY(val)} stroke="#64748b" strokeWidth="0.5" />
                <text x={pad - 6} y={getY(val) + 3} fill="#64748b" fontSize="10" textAnchor="end">{val}</text>
              </g>
           ))}
 
-          {/* Diagonal Perfect Prediction Line */}
-          <line x1={getX(0)} y1={getY(0)} x2={getX(maxVal)} y2={getY(maxVal)} stroke="#cbd5e1" strokeDasharray="4 4" strokeWidth="1.5" opacity="0.6"/>
-          
-          {/* Data Points */}
-          {data.map((d, i) => (
-            <circle 
-              key={i} 
-              cx={getX(d.actual)} 
-              cy={getY(d.predicted)} 
-              r={d.actual > 200 ? 3.5 : 2} 
-              fill={d.actual > 200 ? "#f43f5e" : "#0ea5e9"} 
-              opacity={d.actual > 200 ? 0.75 : 0.45} 
-            />
-          ))}
+          <g clipPath="url(#scatterClip)">
+            {/* Diagonal Perfect Prediction Line */}
+            <line x1={getX(0)} y1={getY(0)} x2={getX(maxVal)} y2={getY(maxVal)} stroke="#cbd5e1" strokeDasharray="4 4" strokeWidth="1" opacity="0.6"/>
+            
+            {/* Data Points with reduced radiuses */}
+            {data.map((d, i) => (
+              <circle 
+                key={i} 
+                cx={getX(d.actual)} 
+                cy={getY(d.predicted)} 
+                r={d.actual > 200 ? 2.5 : 1.5} 
+                fill={d.actual > 200 ? "#f43f5e" : "#0ea5e9"} 
+                opacity={d.actual > 200 ? 0.8 : 0.5} 
+              />
+            ))}
+          </g>
+
+          {/* Draw zoom selection box */}
+          {zoomPan.dragState && zoomPan.dragState.mode === 'zoom' && (
+             <rect 
+               x={Math.min(zoomPan.dragState.startX, zoomPan.dragState.currentX)}
+               y={Math.min(zoomPan.dragState.startY, zoomPan.dragState.currentY)}
+               width={Math.abs(zoomPan.dragState.currentX - zoomPan.dragState.startX)}
+               height={Math.abs(zoomPan.dragState.currentY - zoomPan.dragState.startY)}
+               fill="rgba(244, 63, 94, 0.15)"
+               stroke="#f43f5e"
+               strokeWidth="1"
+               strokeDasharray="4 4"
+             />
+          )}
         </svg>
       </div>
       <div className="mt-4 flex items-center justify-center gap-6 text-xs">
         <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#0ea5e9] opacity-70"></span><span className="text-slate-300">Normal Range (&le;200)</span></div>
         <div className="flex items-center gap-1.5"><span className="w-3.5 h-3.5 rounded-full bg-[#f43f5e] opacity-90"></span><span className="text-slate-300 font-semibold">Severe Range (&gt;200)</span></div>
-        <div className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed border-slate-300"></span><span className="text-slate-300 font-semibold">Perfect Prediction (y=x)</span></div>
+        <div className="flex items-center gap-1.5"><span className="w-4 border-t border-dashed border-slate-300"></span><span className="text-slate-300 font-semibold">Perfect Prediction (y=x)</span></div>
       </div>
     </div>
   );
 }
-
 export default function App() {
   const [stations, setStations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -467,6 +639,10 @@ export default function App() {
   
   // Modal Station controls whether the intelligence modal overlay is open
   const [modalStation, setModalStation] = useState(null);
+
+  const [nearbySources, setNearbySources] = useState(null);
+  const [loadingSources, setLoadingSources] = useState(false);
+
 
   const [stationReadings, setStationReadings] = useState(null);
   const [forecastData, setForecastData] = useState(null);
@@ -934,6 +1110,25 @@ export default function App() {
   }, [stations, selectedStation?.name, navTab, selectedStepIdx, movementData, showFires, firesData]);
 
   // Open Detailed Station Modal
+  
+  // Fetch nearby sources when the 'sources' tab is opened
+  useEffect(() => {
+    if (activeTab === 'sources' && modalStation && !nearbySources && !loadingSources) {
+      setLoadingSources(true);
+      fetch(`${API_BASE}/nearby-sources/${encodeURIComponent(modalStation.name)}`)
+        .then(res => res.json())
+        .then(data => {
+          setNearbySources(data);
+          setLoadingSources(false);
+        })
+        .catch(err => {
+          console.error("Failed to fetch sources", err);
+          setNearbySources({ sources: [], message: "Failed to fetch nearby sources." });
+          setLoadingSources(false);
+        });
+    }
+  }, [activeTab, modalStation, nearbySources, loadingSources]);
+
   const openStationModal = async (station) => {
     setSelectedStation(station);
     setModalStation(station);
@@ -941,6 +1136,7 @@ export default function App() {
     setStationReadings(null);
     setForecastData(null);
     setExplainData(null);
+    setNearbySources(null);
     setActiveTab('current');
 
     try {
@@ -975,6 +1171,24 @@ export default function App() {
     const set = new Set(stations.map(s => s.city || 'Delhi NCR'));
     return ['ALL', ...Array.from(set).sort()];
   }, [stations]);
+
+  // Fetch nearby sources when modal opens
+  useEffect(() => {
+    if (modalStation && !loadingModal) {
+      setLoadingSources(true);
+      fetch(`${API_BASE}/nearby-sources/${encodeURIComponent(modalStation.name)}`)
+        .then(res => res.json())
+        .then(data => {
+          setNearbySources(data);
+          setLoadingSources(false);
+        })
+        .catch(err => {
+          console.error("Failed to fetch sources", err);
+          setNearbySources({ sources: [], message: "Failed to fetch nearby sources." });
+          setLoadingSources(false);
+        });
+    }
+  }, [modalStation, loadingModal]);
 
   const tableStations = useMemo(() => {
     let result = stations.filter(st => {
@@ -2306,6 +2520,18 @@ export default function App() {
                 <Sparkles className="w-3.5 h-3.5 text-amber-400" />
                 <span>Why is pollution changing?</span>
               </button>
+
+              {nearbySources && nearbySources.sources && nearbySources.sources.length > 0 && (
+                <button 
+                  onClick={() => setActiveTab('sources')}
+                  className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                    activeTab === 'sources' ? 'border-orange-500 text-orange-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                  }`}>
+                  <Factory className="w-3.5 h-3.5 text-orange-400" />
+                  <span>Nearby Sources</span>
+                </button>
+              )}
+
             </div>
 
             {/* Modal Body */}
@@ -2367,6 +2593,32 @@ export default function App() {
                         );
                       })}
                     </div>
+                  </div>
+                </div>
+              ) : activeTab === 'sources' && nearbySources && nearbySources.sources && nearbySources.sources.length > 0 ? (
+                <div className="space-y-4">
+                  <div className="p-4 bg-slate-900 border-l-4 border-orange-500 rounded-r-xl">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Factory className="w-5 h-5 text-orange-500" />
+                      <span className="text-sm font-bold text-slate-100">Local Industrial Activity</span>
+                    </div>
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      This station's elevated pollution may be partly influenced by nearby industrial activity, including {nearbySources.sources[0].name} ({nearbySources.sources[0].type}), located {nearbySources.sources[0].distance_km}km away.
+                    </p>
+                  </div>
+                  
+                  <div className="grid gap-2">
+                    {nearbySources.sources.map((src, i) => (
+                      <div key={i} className="p-3 bg-slate-800/50 rounded-lg flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-200">{src.name}</div>
+                          <div className="text-[11px] text-slate-400 mt-0.5">{src.type}</div>
+                        </div>
+                        <div className="text-xs font-mono text-orange-300 bg-orange-950/40 px-2 py-1 rounded">
+                          {src.distance_km} km
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ) : (
