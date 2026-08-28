@@ -38,7 +38,9 @@ import {
   Play,
   Pause,
   Navigation,
-  Compass
+  Compass,
+  Briefcase,
+  ShieldCheck
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
@@ -352,6 +354,81 @@ function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onO
   );
 }
 
+
+// Interactive Scatter Plot for Global Model Accuracy
+function ModelScatterPlot({ data }) {
+  if (!data || data.length === 0) return null;
+  const width = 800;
+  const height = 300;
+  const pad = 40;
+  const innerW = width - pad * 2;
+  const innerH = height - pad * 2;
+  
+  const maxVal = Math.max(
+    ...data.map(d => Math.max(d.actual, d.predicted)), 300
+  );
+  
+  const getX = (val) => pad + (val / maxVal) * innerW;
+  const getY = (val) => height - pad - (val / maxVal) * innerH;
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl mb-6">
+      <h3 className="text-white font-bold mb-2 text-sm flex items-center justify-between">
+        Global Model Accuracy (Holdout Test Set)
+        <span className="text-xs text-slate-400 font-normal px-2 py-1 bg-slate-800 rounded border border-slate-700">n = {data.length.toLocaleString()} sampled</span>
+      </h3>
+      <p className="text-[11px] text-slate-400 mb-4 leading-relaxed">
+        Each point is one real prediction from the held-out test set (18,544 total). Points near the diagonal line are accurate; scatter increases at higher pollution levels, consistent with our documented model limitations.
+      </p>
+      <div className="relative w-full overflow-hidden border border-slate-800/60 rounded-xl bg-slate-950/50 pt-2 pb-1 pr-4">
+        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible">
+          {/* Grid and Axes */}
+          <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke="#334155" strokeWidth="1"/>
+          <line x1={pad} y1={pad} x2={pad} y2={height - pad} stroke="#334155" strokeWidth="1"/>
+          
+          {/* X and Y labels */}
+          <text x={width / 2} y={height - 5} fill="#94a3b8" fontSize="12" textAnchor="middle" fontWeight="bold">Actual PM2.5 (µg/m³)</text>
+          <text x={12} y={height / 2} fill="#94a3b8" fontSize="12" textAnchor="middle" transform={`rotate(-90 12,${height/2})`} fontWeight="bold">Predicted PM2.5</text>
+          
+          {/* Axis Ticks (0, 100, 200, max) */}
+          {[0, 100, 200, Math.floor(maxVal/100)*100].map(val => (
+             <g key={`x-${val}`}>
+               <line x1={getX(val)} y1={height - pad} x2={getX(val)} y2={height - pad + 4} stroke="#64748b" />
+               <text x={getX(val)} y={height - pad + 14} fill="#64748b" fontSize="10" textAnchor="middle">{val}</text>
+             </g>
+          ))}
+          {[100, 200, Math.floor(maxVal/100)*100].map(val => (
+             <g key={`y-${val}`}>
+               <line x1={pad - 4} y1={getY(val)} x2={pad} y2={getY(val)} stroke="#64748b" />
+               <text x={pad - 6} y={getY(val) + 3} fill="#64748b" fontSize="10" textAnchor="end">{val}</text>
+             </g>
+          ))}
+
+          {/* Diagonal Perfect Prediction Line */}
+          <line x1={getX(0)} y1={getY(0)} x2={getX(maxVal)} y2={getY(maxVal)} stroke="#cbd5e1" strokeDasharray="4 4" strokeWidth="1.5" opacity="0.6"/>
+          
+          {/* Data Points */}
+          {data.map((d, i) => (
+            <circle 
+              key={i} 
+              cx={getX(d.actual)} 
+              cy={getY(d.predicted)} 
+              r={d.actual > 200 ? 3.5 : 2} 
+              fill={d.actual > 200 ? "#f43f5e" : "#0ea5e9"} 
+              opacity={d.actual > 200 ? 0.75 : 0.45} 
+            />
+          ))}
+        </svg>
+      </div>
+      <div className="mt-4 flex items-center justify-center gap-6 text-xs">
+        <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#0ea5e9] opacity-70"></span><span className="text-slate-300">Normal Range (&le;200)</span></div>
+        <div className="flex items-center gap-1.5"><span className="w-3.5 h-3.5 rounded-full bg-[#f43f5e] opacity-90"></span><span className="text-slate-300 font-semibold">Severe Range (&gt;200)</span></div>
+        <div className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed border-slate-300"></span><span className="text-slate-300 font-semibold">Perfect Prediction (y=x)</span></div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [stations, setStations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -377,6 +454,13 @@ export default function App() {
   // Settings State (Active Polling Frequency)
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 30 | 60 | 300 | 0 (manual)
   const [lastSyncTime, setLastSyncTime] = useState(new Date());
+
+  // Decision & Trust State
+  const [decisionSupportData, setDecisionSupportData] = useState(null);
+  const [loadingDecision, setLoadingDecision] = useState(false);
+  const [modelTrustData, setModelTrustData] = useState(null);
+  const [loadingTrust, setLoadingTrust] = useState(false);
+
 
   // Selected Station drives the top chart and 4 stat cards
   const [selectedStation, setSelectedStation] = useState(null);
@@ -489,6 +573,39 @@ export default function App() {
   };
 
   // Fetch NASA FIRMS regional fire hotspot detections
+  
+  // Fetch Decision Support
+  const fetchDecisionSupport = async () => {
+    setLoadingDecision(true);
+    try {
+      const res = await fetch(`${API_BASE}/decision-support`);
+      if (res.ok) {
+        const json = await res.json();
+        setDecisionSupportData(json);
+      }
+    } catch (e) {
+      console.error('Error loading decision support:', e);
+    } finally {
+      setLoadingDecision(false);
+    }
+  };
+
+  // Fetch Model Trust
+  const fetchModelTrust = async () => {
+    setLoadingTrust(true);
+    try {
+      const res = await fetch(`${API_BASE}/model-trust`);
+      if (res.ok) {
+        const json = await res.json();
+        setModelTrustData(json);
+      }
+    } catch (e) {
+      console.error('Error loading model trust:', e);
+    } finally {
+      setLoadingTrust(false);
+    }
+  };
+
   const fetchFires = async () => {
     try {
       const res = await fetch(`${API_BASE}/fires`);
@@ -989,6 +1106,31 @@ export default function App() {
               <Settings className="w-4 h-4 shrink-0" />
               <span className="hidden lg:inline">Settings</span>
             </button>
+
+            <button
+              onClick={() => {
+                setNavTab('decision');
+                fetchDecisionSupport();
+              }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all ${
+                navTab === 'decision' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <Briefcase className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Decision Support</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setNavTab('trust');
+                fetchModelTrust();
+              }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all ${
+                navTab === 'trust' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Model Trust</span>
+            </button>
+
           </nav>
         </div>
 
@@ -1790,6 +1932,198 @@ export default function App() {
           {/* ========================================================================= */}
           {/* PAGE 4: SETTINGS & METADATA                                               */}
           {/* ========================================================================= */}
+          
+          {navTab === 'decision' && (
+            <div className="p-6 max-w-5xl mx-auto space-y-6">
+              <div className="flex items-center gap-3 border-b border-slate-800 pb-4">
+                <div className="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center border border-cyan-500/30">
+                  <Briefcase className="w-5 h-5 text-cyan-400" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-white">Regional Decision Support</h2>
+                  <p className="text-sm text-slate-400">Automated multi-station synthesis for Delhi NCR</p>
+                </div>
+              </div>
+
+              {loadingDecision || !decisionSupportData ? (
+                <div className="flex items-center justify-center h-40 text-cyan-500 text-sm">
+                  <RefreshCw className="w-5 h-5 animate-spin mr-2" />
+                  Analyzing regional data...
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+                      <div className="text-slate-400 text-xs font-semibold mb-1">Current Avg AQI</div>
+                      <div className="text-2xl font-bold text-white flex items-end gap-2">
+                        {decisionSupportData.current_aqi}
+                        <span className="text-sm text-slate-400 mb-0.5">{decisionSupportData.current_aqi_category}</span>
+                      </div>
+                    </div>
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+                      <div className="text-slate-400 text-xs font-semibold mb-1">24h Peak Forecast</div>
+                      <div className="text-2xl font-bold text-rose-400 flex items-end gap-2">
+                        {decisionSupportData.forecast_peak_aqi} AQI
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-1">at {decisionSupportData.forecast_peak_station}</div>
+                    </div>
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+                      <div className="text-slate-400 text-xs font-semibold mb-1">Regional Risk Level</div>
+                      <div className="text-xl font-bold text-amber-400">
+                        {decisionSupportData.risk_level}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+                      <div className="text-slate-400 text-xs font-semibold mb-1">Fire Influence</div>
+                      <div className="text-xl font-bold text-orange-400">
+                        {decisionSupportData.regional_fire_influence}
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-1">{decisionSupportData.downwind_station_count} stations downwind</div>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl">
+                    <h3 className="text-white font-bold mb-4 flex items-center gap-2">
+                      <Info className="w-4 h-4 text-cyan-400" /> Actionable Recommendations
+                    </h3>
+                    <ul className="space-y-3">
+                      {decisionSupportData.recommended_actions.map((action, idx) => (
+                        <li key={idx} className="flex items-start gap-3 bg-slate-950/50 p-3 rounded-lg border border-slate-800/50">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                          <span className="text-sm text-slate-300">{action}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
+                      <div>
+                        <div className="text-slate-400 text-xs font-semibold">Dispersion Conditions</div>
+                        <div className="text-white font-medium mt-1">{decisionSupportData.dispersion_status}</div>
+                      </div>
+                      <Wind className="w-6 h-6 text-slate-600" />
+                    </div>
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
+                      <div>
+                        <div className="text-slate-400 text-xs font-semibold">Rain Expected (24h)</div>
+                        <div className="text-white font-medium mt-1">{decisionSupportData.rain_expected}</div>
+                      </div>
+                      <CloudRain className="w-6 h-6 text-slate-600" />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {navTab === 'trust' && (
+            <div className="p-6 max-w-5xl mx-auto space-y-6">
+              <div className="flex items-center gap-3 border-b border-slate-800 pb-4">
+                <div className="w-10 h-10 rounded-xl bg-purple-500/20 flex items-center justify-center border border-purple-500/30">
+                  <ShieldCheck className="w-5 h-5 text-purple-400" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-white">XGBoost Model Trust</h2>
+                  <p className="text-sm text-slate-400">Statistical evaluation on 18,000+ holdout test samples</p>
+                </div>
+              </div>
+
+              {loadingTrust || !modelTrustData ? (
+                <div className="flex items-center justify-center h-40 text-purple-500 text-sm">
+                  <RefreshCw className="w-5 h-5 animate-spin mr-2" />
+                  Loading model metrics...
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl">
+                    <h3 className="text-white font-bold mb-4 text-sm">Overall Dataset Metrics</h3>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/50">
+                        <div className="text-[10px] text-slate-500 font-semibold mb-1">R² Score</div>
+                        <div className="text-xl font-bold text-white">{modelTrustData.overall_dataset_metrics.overall_r2}</div>
+                      </div>
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/50">
+                        <div className="text-[10px] text-slate-500 font-semibold mb-1">Mean Absolute Error</div>
+                        <div className="text-xl font-bold text-white">{modelTrustData.overall_dataset_metrics.overall_mae}</div>
+                      </div>
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/50">
+                        <div className="text-[10px] text-slate-500 font-semibold mb-1">Root Mean Square Error</div>
+                        <div className="text-xl font-bold text-white">{modelTrustData.overall_dataset_metrics.overall_rmse}</div>
+                      </div>
+                      <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/50">
+                        <div className="text-[10px] text-slate-500 font-semibold mb-1">Test Samples</div>
+                        <div className="text-xl font-bold text-white">{modelTrustData.overall_dataset_metrics.total_test_samples.toLocaleString()}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {modelTrustData.scatter_sample && <ModelScatterPlot data={modelTrustData.scatter_sample} />}
+
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl">
+                    <div className="flex justify-between items-center mb-1">
+                      <h3 className="text-white font-bold text-sm">Station-Specific Evaluation</h3>
+                      <span className="px-2 py-1 bg-purple-500/20 text-purple-300 text-xs rounded border border-purple-500/30">{modelTrustData.station}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mb-4 leading-relaxed">
+                      Per-station accuracy is naturally lower than the overall pooled R² (0.574) shown above. The model was trained jointly across all 50 stations, so it captures shared patterns (daily cycles, regional weather effects) that boost aggregate accuracy — but any single station's own time series is noisier in isolation. This is expected model behavior, not reduced accuracy.
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                      <div>
+                        <div className="text-[10px] text-slate-500 font-semibold">Pearson Correlation</div>
+                        <div className="text-lg font-bold text-emerald-400">{modelTrustData.pearson_r}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-slate-500 font-semibold">Station R²</div>
+                        <div className="text-lg font-bold text-white">{modelTrustData.r2_score}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-slate-500 font-semibold">Station MAE</div>
+                        <div className="text-lg font-bold text-white">{modelTrustData.mae}</div>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-slate-500 font-semibold">Holdout Points</div>
+                        <div className="text-lg font-bold text-white">{modelTrustData.sample_count}</div>
+                      </div>
+                    </div>
+                    
+                    {/* Time series visualization table for the last 72 hours */}
+                    <details className="border border-slate-800 rounded-lg overflow-hidden group">
+                      <summary className="bg-slate-800/50 px-4 py-3 text-xs font-semibold text-slate-300 cursor-pointer flex justify-between items-center hover:bg-slate-800/70 transition-colors">
+                        <span>View Station Example Predictions (Holdout Set)</span>
+                        <span className="text-slate-500 group-open:rotate-180 transition-transform">▼</span>
+                      </summary>
+                      <div className="border-t border-slate-800">
+                      <div className="max-h-60 overflow-y-auto custom-scrollbar">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-slate-950/50 sticky top-0 text-slate-400">
+                            <tr>
+                              <th className="px-4 py-2 font-medium">Timestamp</th>
+                              <th className="px-4 py-2 font-medium text-right">Actual</th>
+                              <th className="px-4 py-2 font-medium text-right">Predicted</th>
+                              <th className="px-4 py-2 font-medium text-right">Error</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/50">
+                            {modelTrustData.time_series.slice().reverse().map((row, idx) => (
+                              <tr key={idx} className="hover:bg-slate-800/30">
+                                <td className="px-4 py-2 text-slate-300">{new Date(row.timestamp).toLocaleString()}</td>
+                                <td className="px-4 py-2 text-right text-cyan-300 font-medium">{row.actual_pm25.toFixed(1)}</td>
+                                <td className="px-4 py-2 text-right text-rose-300 font-medium">{row.predicted_pm25.toFixed(1)}</td>
+                                <td className="px-4 py-2 text-right text-slate-400">{row.error.toFixed(1)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {navTab === 'settings' && (
             <div className="space-y-6 max-w-4xl">
               

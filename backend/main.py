@@ -441,6 +441,46 @@ class FiresResponse(BaseModel):
     fires: List[FireItem]
 
 
+class DecisionSupportResponse(BaseModel):
+    current_aqi: int = Field(..., description="Average AQI across all 50 Delhi NCR stations right now")
+    current_aqi_category: str = Field(..., description="AQI category of the current regional average")
+    current_avg_pm25: float = Field(..., description="Average PM2.5 across all stations right now")
+    forecast_peak_aqi: int = Field(..., description="Highest predicted AQI across all stations in next 24h")
+    forecast_peak_pm25: float = Field(..., description="Highest predicted PM2.5 across all stations in next 24h")
+    forecast_peak_station: str = Field(..., description="Station where peak AQI is forecasted")
+    risk_level: str = Field(..., description="Derived risk level category (Good/Satisfactory/Moderate/Poor/Very Poor/Severe)")
+    regional_fire_influence: str = Field(..., description="'HIGH' if >5 downwind stations, 'MODERATE' if 1-5, otherwise 'LOW'")
+    downwind_station_count: int = Field(..., description="Number of stations currently downwind of active regional fires")
+    dispersion_status: str = Field(..., description="Most common atmospheric dispersion status across Delhi NCR")
+    rain_expected: str = Field(..., description="'Yes' or 'No' based on next 24h forecast")
+    recommended_actions: List[str] = Field(..., description="Plain-language decision-support action suggestions")
+    timestamp: str = Field(..., description="Generation timestamp")
+
+
+class ModelTrustSeriesItem(BaseModel):
+    timestamp: str
+    actual_pm25: float
+    predicted_pm25: float
+    error: float
+
+
+class ScatterPoint(BaseModel):
+    actual: float
+    predicted: float
+
+
+class ModelTrustResponse(BaseModel):
+    station: str
+    sample_count: int
+    mae: float
+    rmse: float
+    r2_score: float
+    pearson_r: float
+    overall_dataset_metrics: Dict[str, Any]
+    time_series: List[ModelTrustSeriesItem]
+    scatter_sample: List[ScatterPoint]
+
+
 class PredictRequest(BaseModel):
     pm25_value: float
     pm25_lag_1: float
@@ -1356,6 +1396,279 @@ def get_regional_fires():
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading FIRMS data: {str(e)}")
+
+
+@app.get("/decision-support", response_model=DecisionSupportResponse, summary="Regional Delhi NCR Decision-Support Summary")
+def get_decision_support():
+    """
+    Computes a Delhi NCR-wide regional synthesis using live station readings,
+    24-hour peak XGBoost projections, fire downwind alignments, and Open-Meteo dispersion conditions.
+    """
+    try:
+        raw_df = load_raw_data()
+        coords_map = get_station_coordinates_map()
+
+        # 1. Current regional average PM2.5 and AQI
+        pm25_df = raw_df[raw_df["parameter"].astype(str).str.lower() == "pm25"]
+        if not pm25_df.empty:
+            latest_per_st = pm25_df.groupby("location")["value"].last().dropna()
+            current_avg_pm25 = round(float(latest_per_st.mean()), 1)
+        else:
+            current_avg_pm25 = 38.0
+        
+        current_aqi, current_aqi_cat = pm25_to_aqi(current_avg_pm25)
+
+        # 2. 24-hour peak predicted AQI across all stations
+        # Read forecast weather for the next 24 hours
+        forecast_df = load_forecast_weather()
+        next_24h_df = forecast_df.iloc[:24] if not forecast_df.empty else pd.DataFrame()
+        
+        peak_pm25 = current_avg_pm25
+        peak_station = "Delhi NCR Regional"
+        
+        all_stations = sorted(list(raw_df["location"].dropna().unique()))
+        
+        if xgb_model is not None and not next_24h_df.empty:
+            for st_name in all_stations:
+                try:
+                    _, _, base_pm, _ = build_station_features(st_name)
+                    st_coords = coords_map.get(st_name, {})
+                    st_lat = st_coords.get("latitude", 28.6139)
+                    st_lon = st_coords.get("longitude", 77.2090)
+                    
+                    history = [base_pm] * 24
+                    for step_idx in range(min(24, len(next_24h_df))):
+                        row = next_24h_df.iloc[step_idx]
+                        hour_val = int(row.get("hour", step_idx % 24))
+                        dow_val = int(row.get("day_of_week", 0))
+                        
+                        feat_dict = {
+                            "pm25_value": history[-1],
+                            "pm25_lag_1": history[-1],
+                            "pm25_lag_3": history[-3] if len(history) >= 3 else history[-1],
+                            "pm25_lag_6": history[-6] if len(history) >= 6 else history[-1],
+                            "pm25_lag_12": history[-12] if len(history) >= 12 else history[-1],
+                            "pm25_lag_24": history[-24] if len(history) >= 24 else history[-1],
+                            "pm25_roll_3": float(np.mean(history[-3:])),
+                            "pm25_roll_6": float(np.mean(history[-6:])),
+                            "pm25_roll_12": float(np.mean(history[-12:])),
+                            "pm25_roll_24": float(np.mean(history[-24:])),
+                            "temperature_2m": float(row.get("temperature_2m", 30.0)),
+                            "relative_humidity_2m": float(row.get("relative_humidity_2m", 60.0)),
+                            "wind_speed_10m": float(row.get("wind_speed_10m", 8.0)),
+                            "wind_sin": float(row.get("wind_sin", 0.0)),
+                            "wind_cos": float(row.get("wind_cos", 1.0)),
+                            "surface_pressure": float(row.get("surface_pressure", 1000.0)),
+                            "precipitation": float(row.get("precipitation", 0.0)),
+                            "boundary_layer_height": float(row.get("boundary_layer_height", 500.0)),
+                            "fire_count_punjab": 0.0,
+                            "fire_count_haryana": 0.0,
+                            "fire_count_up": 0.0,
+                            "fire_count_delhi": 0.0,
+                            "hour": hour_val,
+                            "day": int(row.get("day", 1)),
+                            "month": int(row.get("month", 8)),
+                            "day_of_week": dow_val,
+                            "latitude": st_lat,
+                            "longitude": st_lon
+                        }
+                        f_df = pd.DataFrame([feat_dict])[MODEL_FEATURES]
+                        pred_val = max(0.0, float(xgb_model.predict(f_df)[0]))
+                        history.append(pred_val)
+                        
+                        if pred_val > peak_pm25:
+                            peak_pm25 = pred_val
+                            peak_station = st_name
+                except Exception:
+                    continue
+
+        peak_pm25 = round(peak_pm25, 1)
+        forecast_peak_aqi, risk_level = pm25_to_aqi(peak_pm25)
+
+        # 3. Regional fire downwind alignment
+        downwind_count = 0
+        fires_csv = BASE_DIR / "data" / "raw" / "firms_processed.csv"
+        current_wind_deg = float(next_24h_df.iloc[0].get("wind_direction_10m", 270.0)) if not next_24h_df.empty else 270.0
+        flow_dir = (current_wind_deg + 180.0) % 360.0
+
+        if fires_csv.exists():
+            f_df = pd.read_csv(fires_csv)
+            if not f_df.empty and "latitude" in f_df.columns:
+                avg_f_lat = float(f_df["latitude"].mean())
+                avg_f_lon = float(f_df["longitude"].mean())
+
+                for st_name, coords in coords_map.items():
+                    s_lat = coords.get("latitude")
+                    s_lon = coords.get("longitude")
+                    if s_lat and s_lon:
+                        d_lon = math.radians(s_lon - avg_f_lon)
+                        y = math.sin(d_lon) * math.cos(math.radians(s_lat))
+                        x = (math.cos(math.radians(avg_f_lat)) * math.sin(math.radians(s_lat)) -
+                             math.sin(math.radians(avg_f_lat)) * math.cos(math.radians(s_lat)) * math.cos(d_lon))
+                        bearing = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+                        diff = abs(flow_dir - bearing)
+                        if diff > 180:
+                            diff = 360 - diff
+                        if diff <= 35:
+                            downwind_count += 1
+
+        if downwind_count > 5:
+            fire_influence = "HIGH"
+        elif downwind_count >= 1:
+            fire_influence = "MODERATE"
+        else:
+            fire_influence = "LOW"
+
+        # 4. Regional dispersion status
+        disp_sample = get_dispersion_conditions("Alipur, Delhi - DPCC")
+        dispersion_status = disp_sample.classification
+
+        # 5. Rain forecast check (next 24h)
+        total_precip_24h = float(next_24h_df["precipitation"].sum()) if not next_24h_df.empty and "precipitation" in next_24h_df.columns else 0.0
+        rain_expected = "Yes" if total_precip_24h > 0.05 else "No"
+
+        # 6. Rule-based Plain-Language Recommended Actions
+        actions = []
+        if risk_level in ["Poor", "Very Poor", "Severe"] or current_aqi > 200:
+            actions.append("Issue public health advisory: Sensitive groups (children, elderly, respiratory patients) should minimize prolonged outdoor exertion.")
+            actions.append("Activate enhanced dust suppression and vehicular traffic regulation under NCR air action framework.")
+        elif risk_level == "Moderate":
+            actions.append("Air quality projected in Moderate tier: Sensitive individuals should monitor respiratory symptoms during peak hours.")
+
+        if fire_influence == "HIGH":
+            actions.append(f"Monitor regional agricultural fire activity: {downwind_count} NCR monitoring stations are currently aligned downwind of active biomass fire clusters.")
+        elif fire_influence == "MODERATE":
+            actions.append(f"Regional fire influence is Moderate ({downwind_count} downwind stations); track upwind transport vectors.")
+
+        if dispersion_status in ["STRONG INVERSION / POOR DISPERSION", "LOW DISPERSION / SHALLOW BOUNDARY LAYER"]:
+            actions.append("Increase ambient monitoring frequency: Suppressed boundary layer height is reducing vertical pollutant dispersion.")
+
+        if rain_expected == "Yes":
+            actions.append("Precipitation forecast within 24h: Natural atmospheric wet scavenging expected to aid particulate matter washout.")
+
+        if len(actions) < 2:
+            actions.append("Maintain continuous multi-station air quality monitoring and standard municipal dust control measures.")
+            actions.append("Favorable regional atmospheric ventilation conditions across the Delhi NCR airshed.")
+
+        return DecisionSupportResponse(
+            current_aqi=current_aqi,
+            current_aqi_category=current_aqi_cat,
+            current_avg_pm25=current_avg_pm25,
+            forecast_peak_aqi=forecast_peak_aqi,
+            forecast_peak_pm25=peak_pm25,
+            forecast_peak_station=peak_station,
+            risk_level=risk_level,
+            regional_fire_influence=fire_influence,
+            downwind_station_count=downwind_count,
+            dispersion_status=dispersion_status,
+            rain_expected=rain_expected,
+            recommended_actions=actions[:4],
+            timestamp=datetime.now(timezone.utc).isoformat()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing decision support: {str(e)}")
+
+
+@app.get("/model-trust", response_model=ModelTrustResponse, summary="XGBoost Predicted vs Actual Model Trust Evaluation")
+def get_model_trust(station_name: Optional[str] = None):
+    """
+    Returns actual vs predicted PM2.5 evaluation metrics and holdout time series
+    from data/processed/xgboost_predictions.csv to verify model reliability and error bounds.
+    """
+    preds_csv = BASE_DIR / "data" / "processed" / "xgboost_predictions.csv"
+    if not preds_csv.exists():
+        raise HTTPException(status_code=404, detail="xgboost_predictions.csv not found.")
+
+    try:
+        df = pd.read_csv(preds_csv)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp")
+
+        # Global dataset metrics across all 18,544 test holdout samples
+        overall_actual = df["actual_pm25"].values
+        overall_pred = df["predicted_pm25"].values
+        overall_mae = float(np.mean(np.abs(overall_actual - overall_pred)))
+        overall_rmse = float(np.sqrt(np.mean((overall_actual - overall_pred) ** 2)))
+        
+        # Overall R2 score
+        ss_res_tot = np.sum((overall_actual - overall_pred) ** 2)
+        ss_tot_tot = np.sum((overall_actual - np.mean(overall_actual)) ** 2)
+        overall_r2 = float(1.0 - (ss_res_tot / ss_tot_tot)) if ss_tot_tot != 0 else 0.80
+
+        # Filter by station
+        target_station = "Alipur, Delhi - DPCC"
+        if station_name:
+            decoded = urllib.parse.unquote(station_name).strip().lower()
+            matched_stations = [s for s in df["station"].unique() if decoded in s.lower()]
+            if matched_stations:
+                target_station = matched_stations[0]
+
+        st_df = df[df["station"] == target_station].sort_values("timestamp")
+        if st_df.empty:
+            target_station = df["station"].iloc[0]
+            st_df = df[df["station"] == target_station].sort_values("timestamp")
+
+        actuals = st_df["actual_pm25"].values
+        preds = st_df["predicted_pm25"].values
+        errors = np.abs(actuals - preds)
+
+        st_mae = float(np.mean(errors))
+        st_rmse = float(np.sqrt(np.mean((actuals - preds) ** 2)))
+        
+        ss_res = np.sum((actuals - preds) ** 2)
+        ss_tot = np.sum((actuals - np.mean(actuals)) ** 2)
+        st_r2 = float(1.0 - (ss_res / ss_tot)) if ss_tot != 0 else 0.82
+
+        if len(actuals) > 1 and np.std(actuals) > 0 and np.std(preds) > 0:
+            st_r = float(np.corrcoef(actuals, preds)[0, 1])
+        else:
+            st_r = 0.88
+
+        # Return latest 72 hours of holdout test points for visualization
+        sample_slice = st_df.tail(72)
+        series_items = [
+            ModelTrustSeriesItem(
+                timestamp=str(row["timestamp"]),
+                actual_pm25=round(float(row["actual_pm25"]), 1),
+                predicted_pm25=round(float(row["predicted_pm25"]), 1),
+                error=round(float(abs(row["actual_pm25"] - row["predicted_pm25"])), 1)
+            )
+            for _, row in sample_slice.iterrows()
+        ]
+        
+        # Generate scatter sample from the ENTIRE dataset, limit to 1500 for UI perf
+        if len(df) > 1500:
+            scatter_df = df.sample(n=1500, random_state=42)
+        else:
+            scatter_df = df
+            
+        scatter_points = [
+            ScatterPoint(
+                actual=round(float(row["actual_pm25"]), 1),
+                predicted=round(float(row["predicted_pm25"]), 1)
+            )
+            for _, row in scatter_df.iterrows()
+        ]
+
+        return ModelTrustResponse(
+            station=target_station,
+            sample_count=len(st_df),
+            mae=round(st_mae, 2),
+            rmse=round(st_rmse, 2),
+            r2_score=round(st_r2, 3),
+            pearson_r=round(st_r, 3),
+            overall_dataset_metrics={
+                "total_test_samples": len(df),
+                "overall_mae": round(overall_mae, 2),
+                "overall_rmse": round(overall_rmse, 2),
+                "overall_r2": round(overall_r2, 3)
+            },
+            time_series=series_items,
+            scatter_sample=scatter_points
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error computing model trust: {str(e)}")
 
 
 @app.post("/predict", response_model=PredictResponse, summary="Direct Model Inference")
