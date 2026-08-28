@@ -1,0 +1,2148 @@
+import React, { useEffect, useState, useRef, useMemo } from 'react';
+import L from 'leaflet';
+import { 
+  Wind, 
+  MapPin, 
+  Activity, 
+  RefreshCw, 
+  TrendingUp, 
+  TrendingDown,
+  Search, 
+  Layers, 
+  AlertTriangle,
+  Info,
+  Calendar,
+  X,
+  HelpCircle,
+  Sparkles,
+  ArrowUpRight,
+  ArrowDownRight,
+  Flame,
+  Thermometer,
+  CloudRain,
+  Gauge,
+  LayoutDashboard,
+  Bell,
+  Settings,
+  ShieldAlert,
+  ChevronRight,
+  ExternalLink,
+  Sliders,
+  Database,
+  Cpu,
+  Clock,
+  CheckCircle2,
+  AlertCircle,
+  ArrowUpDown,
+  Filter,
+  Play,
+  Pause,
+  Navigation,
+  Compass
+} from 'lucide-react';
+
+const API_BASE = 'http://localhost:8000';
+const DELHI_CENTER = [28.6139, 77.2090];
+
+// Calculate forward azimuth/bearing in degrees from point 1 to point 2
+const calculateBearing = (lat1, lon1, lat2, lon2) => {
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos((lat2 * Math.PI) / 180);
+  const x =
+    Math.cos((lat1 * Math.PI) / 180) * Math.sin((lat2 * Math.PI) / 180) -
+    Math.sin((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.cos(dLon);
+  const brng = (Math.atan2(y, x) * 180) / Math.PI;
+  return (brng + 360) % 360;
+};
+
+// Check if a station is geographically downwind of active regional fires under current wind conditions
+const checkIsDownwindOfFires = (stationLat, stationLon, fires, windDirDeg) => {
+  if (!fires || fires.length === 0 || windDirDeg === undefined || windDirDeg === null) return false;
+  // Centroid of active fire detections
+  const avgFireLat = fires.reduce((a, b) => a + b.latitude, 0) / fires.length;
+  const avgFireLon = fires.reduce((a, b) => a + b.longitude, 0) / fires.length;
+
+  const bearingFromFireToStation = calculateBearing(avgFireLat, avgFireLon, stationLat, stationLon);
+  const flowDir = (windDirDeg + 180) % 360; // downwind trajectory
+
+  let angleDiff = Math.abs(flowDir - bearingFromFireToStation);
+  if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+  return angleDiff <= 35; // within ±35 degrees
+};
+
+// 7 Representative spatial anchors across Delhi NCR for Open-Meteo wind vectors
+const WIND_GRID_COORDINATES = [
+  { lat: 28.75, lng: 77.05 },
+  { lat: 28.75, lng: 77.30 },
+  { lat: 28.62, lng: 77.02 },
+  { lat: 28.62, lng: 77.22 },
+  { lat: 28.62, lng: 77.40 },
+  { lat: 28.45, lng: 77.05 },
+  { lat: 28.45, lng: 77.30 }
+];
+
+// Plain language feature descriptions for SHAP explainability
+const FEATURE_DICTIONARY = {
+  recent_pollution_trend: { label: 'Recent pollution trend', unit: 'µg/m³', icon: '📊' },
+  temperature_2m: { label: 'Temperature', unit: '°C', icon: '🌡️' },
+  relative_humidity_2m: { label: 'Humidity', unit: '%', icon: '💧' },
+  wind_speed_10m: { label: 'Wind speed', unit: 'm/s', icon: '💨' },
+  wind_sin: { label: 'Wind direction (East/West)', unit: '', icon: '🧭' },
+  wind_cos: { label: 'Wind direction (North/South)', unit: '', icon: '🧭' },
+  boundary_layer_height: { label: 'Atmospheric mixing height (PBL)', unit: 'm', icon: '🌫️' },
+  surface_pressure: { label: 'Air pressure', unit: 'hPa', icon: '⏱️' },
+  precipitation: { label: 'Rainfall', unit: 'mm', icon: '🌧️' },
+  fire_count_punjab: { label: 'Fires in Punjab', unit: 'fires', icon: '🔥' },
+  fire_count_haryana: { label: 'Fires in Haryana', unit: 'fires', icon: '🔥' },
+  fire_count_up: { label: 'Fires in Uttar Pradesh', unit: 'fires', icon: '🔥' },
+  fire_count_delhi: { label: 'Fires in Delhi', unit: 'fires', icon: '🔥' },
+  hour: { label: 'Time of day', unit: ':00 hrs', icon: '🕒' },
+  month: { label: 'Seasonal pattern', unit: '', icon: '📅' }
+};
+
+// PM2.5 Theme Styling
+function getPM25Theme(val) {
+  if (val === null || val === undefined) {
+    return {
+      bg: 'bg-slate-700',
+      border: 'border-slate-500',
+      text: 'text-slate-400',
+      hex: '#64748b',
+      label: 'No Data',
+      badge: 'bg-slate-800 text-slate-400 border-slate-700'
+    };
+  }
+  if (val < 50) {
+    return {
+      bg: 'bg-emerald-500',
+      border: 'border-emerald-400',
+      text: 'text-emerald-400',
+      hex: '#10b981',
+      label: 'Good (<50)',
+      badge: 'bg-emerald-950/80 text-emerald-300 border-emerald-500/30'
+    };
+  }
+  if (val <= 100) {
+    return {
+      bg: 'bg-amber-400',
+      border: 'border-amber-300',
+      text: 'text-amber-300',
+      hex: '#f59e0b',
+      label: 'Moderate (50-100)',
+      badge: 'bg-amber-950/80 text-amber-300 border-amber-500/30'
+    };
+  }
+  if (val <= 200) {
+    return {
+      bg: 'bg-orange-500',
+      border: 'border-orange-400',
+      text: 'text-orange-400',
+      hex: '#f97316',
+      label: 'Poor (100-200)',
+      badge: 'bg-orange-950/80 text-orange-300 border-orange-500/30'
+    };
+  }
+  return {
+    bg: 'bg-rose-600',
+    border: 'border-rose-400',
+    text: 'text-rose-400',
+    hex: '#e11d48',
+    label: 'Severe (200+)',
+    badge: 'bg-rose-950/80 text-rose-300 border-rose-500/30'
+  };
+}
+
+// Interactive Multi-Line Trend Chart (SVG)
+function MultiLineTrendChart({ historyData, days, onDaysChange, stationName, onOpenModal }) {
+  const [hoverIndex, setHoverIndex] = useState(null);
+
+  if (!historyData || historyData.length === 0) {
+    return (
+      <div className="h-60 flex items-center justify-center text-slate-500 text-xs bg-slate-900/40 rounded-2xl border border-slate-800">
+        <RefreshCw className="w-4 h-4 animate-spin mr-2 text-cyan-500" />
+        Loading real historical telemetry for {stationName}...
+      </div>
+    );
+  }
+
+  const width = 800;
+  const height = 210;
+  const padLeft = 45;
+  const padRight = 45;
+  const padTop = 18;
+  const padBottom = 28;
+
+  const innerWidth = width - padLeft - padRight;
+  const innerHeight = height - padTop - padBottom;
+
+  const pmValues = historyData.map(d => d.pm25);
+  const tempValues = historyData.map(d => d.temperature);
+
+  const minPm = 0;
+  const maxPm = Math.max(80, Math.ceil(Math.max(...pmValues) / 20) * 20);
+
+  const minTemp = Math.floor(Math.min(...tempValues) - 2);
+  const maxTemp = Math.ceil(Math.max(...tempValues) + 2);
+
+  const getX = (i) => padLeft + (i / (historyData.length - 1)) * innerWidth;
+  const getYPm = (val) => padTop + innerHeight - ((val - minPm) / (maxPm - minPm)) * innerHeight;
+  const getYTemp = (val) => padTop + innerHeight - ((val - minTemp) / (maxTemp - minTemp)) * innerHeight;
+
+  // Build SVG Path Strings
+  const pmPath = historyData.map((d, i) => `${i === 0 ? 'M' : 'L'} ${getX(i).toFixed(1)} ${getYPm(d.pm25).toFixed(1)}`).join(' ');
+  const tempPath = historyData.map((d, i) => `${i === 0 ? 'M' : 'L'} ${getX(i).toFixed(1)} ${getYTemp(d.temperature).toFixed(1)}`).join(' ');
+
+  const pmAreaPath = `${pmPath} L ${getX(historyData.length - 1)} ${padTop + innerHeight} L ${padLeft} ${padTop + innerHeight} Z`;
+  const hoveredPoint = hoverIndex !== null ? historyData[hoverIndex] : null;
+
+  return (
+    <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl backdrop-blur-md">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <h3 className="font-bold text-sm text-white font-heading flex items-center gap-2">
+              <span>Historical Trend: <span className="text-cyan-400">{stationName}</span></span>
+            </h3>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-950/70 text-cyan-300 border border-cyan-500/30 font-medium">
+              Real Historical Telemetry
+            </span>
+          </div>
+          <p className="text-[11px] text-slate-400 mt-0.5">
+            Station PM2.5 vs. Regional Ambient Temperature (Hourly resolution)
+          </p>
+        </div>
+
+        <div className="flex items-center gap-3.5">
+          <div className="flex items-center gap-3 text-xs font-semibold">
+            <div className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-sm shadow-cyan-500/50"></span>
+              <span className="text-cyan-300">PM2.5 (µg/m³)</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-rose-500 shadow-sm shadow-rose-500/50"></span>
+              <span className="text-rose-300">Temperature (°C)</span>
+            </div>
+          </div>
+
+          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-xs">
+            <button
+              onClick={() => onDaysChange(7)}
+              className={`px-2.5 py-1 rounded-md transition-all font-semibold ${
+                days === 7 ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-slate-200'
+              }`}>
+              7 Days
+            </button>
+            <button
+              onClick={() => onDaysChange(30)}
+              className={`px-2.5 py-1 rounded-md transition-all font-semibold ${
+                days === 30 ? 'bg-cyan-500 text-slate-950 shadow-md' : 'text-slate-400 hover:text-slate-200'
+              }`}>
+              30 Days
+            </button>
+          </div>
+
+          <button
+            onClick={onOpenModal}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition-all">
+            <ExternalLink className="w-3 h-3 text-cyan-400" />
+            <span className="hidden sm:inline">Inspect AI Details</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="relative w-full overflow-hidden">
+        <svg 
+          viewBox={`0 0 ${width} ${height}`} 
+          className="w-full h-auto overflow-visible cursor-crosshair"
+          onMouseLeave={() => setHoverIndex(null)}>
+          <defs>
+            <linearGradient id="pmGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.20" />
+              <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.0" />
+            </linearGradient>
+          </defs>
+
+          {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
+            const y = padTop + innerHeight * ratio;
+            const pmVal = Math.round(maxPm - ratio * (maxPm - minPm));
+            const tempVal = (maxTemp - ratio * (maxTemp - minTemp)).toFixed(1);
+            return (
+              <g key={idx}>
+                <line x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="#1e293b" strokeDasharray="3 3" />
+                <text x={padLeft - 8} y={y + 3} fill="#64748b" fontSize="9" textAnchor="end" fontFamily="sans-serif">
+                  {pmVal}
+                </text>
+                <text x={width - padRight + 8} y={y + 3} fill="#fda4af" fontSize="9" textAnchor="start" fontFamily="sans-serif">
+                  {tempVal}°
+                </text>
+              </g>
+            );
+          })}
+
+          <path d={pmAreaPath} fill="url(#pmGradient)" />
+          <path d={tempPath} fill="none" stroke="#f43f5e" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={pmPath} fill="none" stroke="#06b6d4" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+
+          {historyData.map((d, i) => (
+            <rect
+              key={i}
+              x={getX(i) - (innerWidth / historyData.length) / 2}
+              y={padTop}
+              width={innerWidth / historyData.length}
+              height={innerHeight}
+              fill="transparent"
+              onMouseEnter={() => setHoverIndex(i)}
+            />
+          ))}
+
+          {hoverIndex !== null && (
+            <g>
+              <line
+                x1={getX(hoverIndex)}
+                y1={padTop}
+                x2={getX(hoverIndex)}
+                y2={padTop + innerHeight}
+                stroke="#94a3b8"
+                strokeWidth="1"
+                strokeDasharray="2 2"
+              />
+              <circle
+                cx={getX(hoverIndex)}
+                cy={getYPm(historyData[hoverIndex].pm25)}
+                r="3.5"
+                fill="#06b6d4"
+                stroke="#0f172a"
+                strokeWidth="1.5"
+              />
+              <circle
+                cx={getX(hoverIndex)}
+                cy={getYTemp(historyData[hoverIndex].temperature)}
+                r="3.5"
+                fill="#f43f5e"
+                stroke="#0f172a"
+                strokeWidth="1.5"
+              />
+            </g>
+          )}
+        </svg>
+
+        {hoveredPoint && (
+          <div 
+            style={{ 
+              left: `${Math.min(80, Math.max(10, (hoverIndex / (historyData.length - 1)) * 100))}%`,
+              top: '8px'
+            }}
+            className="absolute -translate-x-1/2 bg-slate-950/95 border border-slate-700 px-3 py-2 rounded-xl shadow-2xl pointer-events-none text-xs z-30 min-w-[140px]">
+            <div className="text-[10px] text-slate-400 font-medium border-b border-slate-800 pb-1 mb-1.5">
+              {new Date(hoveredPoint.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+            </div>
+            <div className="flex items-center justify-between gap-3 text-cyan-300 font-bold">
+              <span>PM2.5:</span>
+              <span>{hoveredPoint.pm25} µg/m³</span>
+            </div>
+            <div className="flex items-center justify-between gap-3 text-rose-400 font-bold mt-0.5">
+              <span>Temp:</span>
+              <span>{hoveredPoint.temperature} °C</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [stations, setStations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  
+  // Dashboard Map Search & Trace State
+  const [mapSearchQuery, setMapSearchQuery] = useState('');
+  const [isSearchDropdownOpen, setIsSearchDropdownOpen] = useState(false);
+  
+  // Navigation & Page State
+  const [navTab, setNavTab] = useState('dashboard'); // 'dashboard' | 'stations' | 'alerts' | 'settings'
+
+  // Stations Page State
+  const [stationSortField, setStationSortField] = useState('pm25'); // 'pm25' | 'aqi' | 'name'
+  const [stationSortAsc, setStationSortAsc] = useState(false);
+  const [stationFilterCity, setStationFilterCity] = useState('ALL');
+
+  // Alerts Page State
+  const [alertsData, setAlertsData] = useState(null);
+  const [loadingAlerts, setLoadingAlerts] = useState(false);
+
+  // Settings State (Active Polling Frequency)
+  const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 30 | 60 | 300 | 0 (manual)
+  const [lastSyncTime, setLastSyncTime] = useState(new Date());
+
+  // Selected Station drives the top chart and 4 stat cards
+  const [selectedStation, setSelectedStation] = useState(null);
+  
+  // Modal Station controls whether the intelligence modal overlay is open
+  const [modalStation, setModalStation] = useState(null);
+
+  const [stationReadings, setStationReadings] = useState(null);
+  const [forecastData, setForecastData] = useState(null);
+  const [explainData, setExplainData] = useState(null);
+  const [dispersionData, setDispersionData] = useState(null);
+  const [historyData, setHistoryData] = useState([]);
+  const [historyDays, setHistoryDays] = useState(7);
+  const [loadingModal, setLoadingModal] = useState(false);
+  const [activeTab, setActiveTab] = useState('current'); // 'current' | 'forecast' | 'explain'
+
+  // Filter stations matching map search query
+  const searchMatches = useMemo(() => {
+    if (!mapSearchQuery.trim()) return [];
+    const q = mapSearchQuery.trim().toLowerCase();
+    return stations.filter(st => 
+      st.name.toLowerCase().includes(q) || (st.city && st.city.toLowerCase().includes(q))
+    ).slice(0, 6);
+  }, [mapSearchQuery, stations]);
+
+  // Handler: Select a station from search -> trace on map, select, and view full intelligence modal
+  const handleStationSearchSelect = (station) => {
+    if (!station) return;
+    setSelectedStation(station);
+    setMapSearchQuery(station.name);
+    setIsSearchDropdownOpen(false);
+    
+    // Smoothly fly map to station
+    if (mapInstanceRef.current && station.latitude && station.longitude) {
+      mapInstanceRef.current.flyTo([station.latitude, station.longitude], 12, { duration: 0.9 });
+    }
+    
+    // Open station intelligence modal to view all data
+    openStationModal(station);
+  };
+
+  // Pollution Movement Time-Slider State
+  const [movementData, setMovementData] = useState(null);
+  const [selectedStepIdx, setSelectedStepIdx] = useState(0);
+  const [isPlayingMovement, setIsPlayingMovement] = useState(false);
+  const [loadingMovement, setLoadingMovement] = useState(false);
+
+  // NASA FIRMS Regional Fires State
+  const [firesData, setFiresData] = useState(null);
+  const [showFires, setShowFires] = useState(true);
+
+  const mapContainerRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersLayerRef = useRef(null);
+  const windArrowsLayerRef = useRef(null);
+  const firesLayerRef = useRef(null);
+
+  // Fetch stations from backend
+  const fetchStations = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/stations`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch stations`);
+      const data = await res.json();
+      setStations(data);
+      setLastSyncTime(new Date());
+
+      if (!selectedStation && data.length > 0) {
+        setSelectedStation(data[0]);
+      }
+    } catch (err) {
+      console.error(err);
+      setError('Unable to reach backend at ' + API_BASE + '. Ensure uvicorn is running.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Fetch alerts from backend
+  const fetchAlerts = async () => {
+    setLoadingAlerts(true);
+    try {
+      const res = await fetch(`${API_BASE}/alerts`);
+      if (res.ok) {
+        const json = await res.json();
+        setAlertsData(json);
+      }
+    } catch (e) {
+      console.error('Error loading alerts:', e);
+    } finally {
+      setLoadingAlerts(false);
+    }
+  };
+
+  // Fetch 72-hour pollution movement time-step forecasts
+  const fetchMovementForecast = async () => {
+    setLoadingMovement(true);
+    try {
+      const res = await fetch(`${API_BASE}/movement-forecast`);
+      if (res.ok) {
+        const json = await res.json();
+        setMovementData(json);
+      }
+    } catch (e) {
+      console.error('Failed to load movement forecast:', e);
+    } finally {
+      setLoadingMovement(false);
+    }
+  };
+
+  // Fetch NASA FIRMS regional fire hotspot detections
+  const fetchFires = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/fires`);
+      if (res.ok) {
+        const json = await res.json();
+        setFiresData(json);
+      }
+    } catch (e) {
+      console.error('Failed to load FIRMS fires:', e);
+    }
+  };
+
+  useEffect(() => {
+    fetchStations();
+    fetchAlerts();
+    fetchMovementForecast();
+    fetchFires();
+  }, []);
+
+  // Auto-advance movement time slider when playing
+  useEffect(() => {
+    let interval = null;
+    if (isPlayingMovement) {
+      interval = setInterval(() => {
+        setSelectedStepIdx((prev) => (prev + 1) % 6);
+      }, 1800);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isPlayingMovement]);
+
+  // Periodic polling controlled by settings
+  useEffect(() => {
+    if (!refreshIntervalSec || refreshIntervalSec <= 0) return;
+    const interval = setInterval(() => {
+      fetchStations();
+      fetchAlerts();
+      fetchMovementForecast();
+    }, refreshIntervalSec * 1000);
+    return () => clearInterval(interval);
+  }, [refreshIntervalSec]);
+
+  // Fetch station history trend & dispersion when selectedStation or historyDays changes
+  useEffect(() => {
+    if (!selectedStation) return;
+    const fetchHistory = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/history/${encodeURIComponent(selectedStation.name)}?days=${historyDays}`);
+        if (res.ok) {
+          const json = await res.json();
+          setHistoryData(json.history || []);
+        }
+      } catch (e) {
+        console.error('Failed to load history:', e);
+      }
+    };
+
+    const fetchDispersion = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/dispersion/${encodeURIComponent(selectedStation.name)}`);
+        if (res.ok) {
+          const json = await res.json();
+          setDispersionData(json);
+        }
+      } catch (e) {
+        console.error('Failed to load dispersion:', e);
+      }
+    };
+
+    fetchHistory();
+    fetchDispersion();
+  }, [selectedStation?.name, historyDays]);
+
+  // Initialize Leaflet Map (when on dashboard tab)
+  useEffect(() => {
+    if (navTab !== 'dashboard') {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+      return;
+    }
+
+    if (!mapContainerRef.current) return;
+    if (mapInstanceRef.current) return;
+
+    const map = L.map(mapContainerRef.current, {
+      center: DELHI_CENTER,
+      zoom: 10,
+      zoomControl: false,
+    });
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19,
+    }).addTo(map);
+
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    const markersLayer = L.layerGroup().addTo(map);
+    const windLayer = L.layerGroup().addTo(map);
+    const firesLayer = L.layerGroup().addTo(map);
+    markersLayerRef.current = markersLayer;
+    windArrowsLayerRef.current = windLayer;
+    firesLayerRef.current = firesLayer;
+    mapInstanceRef.current = map;
+
+    return () => {
+      map.remove();
+      mapInstanceRef.current = null;
+    };
+  }, [navTab]);
+
+  // Update Markers and Wind Direction Arrows when step, stations, or selection changes
+  useEffect(() => {
+    if (!mapInstanceRef.current || !markersLayerRef.current || navTab !== 'dashboard') return;
+
+    markersLayerRef.current.clearLayers();
+    if (windArrowsLayerRef.current) {
+      windArrowsLayerRef.current.clearLayers();
+    }
+
+    const currentStep = movementData?.steps?.[selectedStepIdx];
+    const stepStationMap = currentStep ? new Map(currentStep.stations.map(s => [s.station_name, s])) : null;
+
+    stations.forEach((st) => {
+      if (!st.latitude || !st.longitude) return;
+
+      const isSelected = selectedStation?.name === st.name;
+      const stepData = stepStationMap?.get(st.name);
+      
+      const effectivePM = stepData ? stepData.pm25 : st.latest_pm25;
+      const effectiveAQI = stepData ? stepData.aqi : st.latest_aqi;
+      const effectiveCat = stepData ? stepData.aqi_category : st.aqi_category;
+      
+      const theme = getPM25Theme(effectivePM);
+      const displayVal = effectivePM !== null && effectivePM !== undefined ? Math.round(effectivePM) : '--';
+
+      // Downwind geographic directional check from active fire centroid
+      const isDownwind = checkIsDownwindOfFires(
+        st.latitude, 
+        st.longitude, 
+        firesData?.fires, 
+        currentStep?.wind?.direction_deg
+      );
+
+      const customIcon = L.divIcon({
+        className: 'custom-station-marker',
+        html: `
+          <div class="relative group cursor-pointer">
+            <div style="background-color: ${theme.hex};" 
+                 class="w-9 h-9 rounded-full flex items-center justify-center text-white font-bold text-xs shadow-lg transform transition-all duration-300 ${
+                   isSelected 
+                     ? 'ring-4 ring-cyan-400 ring-offset-2 ring-offset-slate-950 scale-125 z-50' 
+                     : 'border-2 border-white/90 group-hover:scale-110'
+                 }">
+              ${displayVal}
+            </div>
+            
+            ${isDownwind ? `
+              <!-- Downwind Amber Highlighted Ring & Flame Badge -->
+              <div class="absolute -inset-1.5 rounded-full border-2 border-dashed border-amber-400 animate-pulse pointer-events-none shadow-[0_0_10px_rgba(251,191,36,0.9)]"></div>
+              <div class="absolute -top-2 -right-2 w-4 h-4 rounded-full bg-amber-500 border border-slate-950 flex items-center justify-center text-[9px] shadow-md z-30 pointer-events-none" title="Geographically Downwind of Regional Fires">
+                🔥
+              </div>
+            ` : `
+              <div style="background-color: ${theme.hex};" 
+                   class="absolute inset-0 rounded-full opacity-40 animate-ping -z-10">
+              </div>
+            `}
+          </div>
+        `,
+        iconSize: [36, 36],
+        iconAnchor: [18, 18],
+        popupAnchor: [0, -20]
+      });
+
+      const marker = L.marker([st.latitude, st.longitude], { icon: customIcon });
+
+      marker.on('click', () => {
+        setSelectedStation(st);
+      });
+
+      const offsetLabel = currentStep ? currentStep.label : 'Now';
+      const popupHtml = `
+        <div class="p-1 min-w-[200px] text-slate-100 font-sans">
+          <div class="flex items-center justify-between gap-2 border-b border-slate-700/60 pb-2 mb-2">
+            <span class="text-xs font-semibold px-2 py-0.5 rounded-full ${theme.badge}">
+              AQI ${effectiveAQI || '--'} (${effectiveCat || theme.label})
+            </span>
+            <span class="text-[10px] text-cyan-300 font-bold bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-500/30">
+              Offset: ${offsetLabel}
+            </span>
+          </div>
+          
+          <h4 class="font-bold text-sm text-white mb-1 leading-snug">${st.name}</h4>
+          
+          ${isDownwind ? `
+            <div class="mt-1 mb-2 px-2 py-1 rounded bg-amber-950/60 border border-amber-500/40 text-[10px] text-amber-300 font-semibold flex items-center gap-1.5">
+              <span>🔥</span>
+              <span>Geographically Downwind of Regional Fires</span>
+            </div>
+          ` : ''}
+
+          <div class="flex items-baseline gap-2 my-2">
+            <span class="text-2xl font-extrabold text-white">${effectivePM !== null ? effectivePM : 'N/A'}</span>
+            <span class="text-xs text-slate-400 font-medium">µg/m³ PM2.5 (${offsetLabel === 'Now' ? 'Live Reading' : 'Model Projection'})</span>
+          </div>
+          <button id="view-details-btn-${st.name.replace(/[^a-zA-Z0-9]/g, '')}" 
+                  class="w-full py-1.5 px-3 bg-cyan-600 hover:bg-cyan-500 active:bg-cyan-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 shadow-md">
+            <span>Open Intelligence Modal</span> &rarr;
+          </button>
+        </div>
+      `;
+
+      marker.bindPopup(popupHtml, { maxWidth: 280 });
+
+      marker.on('popupopen', () => {
+        const btnId = `view-details-btn-${st.name.replace(/[^a-zA-Z0-9]/g, '')}`;
+        const btn = document.getElementById(btnId);
+        if (btn) {
+          btn.onclick = () => {
+            setSelectedStation(st);
+            openStationModal(st);
+          };
+        }
+      });
+
+      marker.addTo(markersLayerRef.current);
+    });
+
+    // Render 7 evenly spaced, prominent wind direction arrows across NCR
+    if (windArrowsLayerRef.current && currentStep?.wind) {
+      const wind = currentStep.wind;
+      const flowAngle = (wind.direction_deg + 180) % 360; // points in the direction air is flowing
+      const speedScale = Math.min(1.4, Math.max(0.8, wind.speed_ms / 8.0));
+      const speedOpacity = Math.min(0.95, Math.max(0.6, wind.speed_ms / 14.0 + 0.35));
+
+      WIND_GRID_COORDINATES.forEach((pt) => {
+        const windIcon = L.divIcon({
+          className: 'custom-wind-arrow-marker',
+          html: `
+            <div style="transform: rotate(${flowAngle}deg); transform-origin: center center;"
+                 class="w-10 h-10 flex items-center justify-center pointer-events-none transition-transform duration-700">
+              <div style="transform: scale(${speedScale}); opacity: ${speedOpacity};" class="flex flex-col items-center justify-center">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" class="filter drop-shadow-[0_0_10px_rgba(6,182,212,1)]">
+                  <polygon points="12,2 21,21 12,16.5 3,21" fill="#06b6d4" stroke="#ffffff" stroke-width="1.8" stroke-linejoin="round" />
+                </svg>
+              </div>
+            </div>
+          `,
+          iconSize: [40, 40],
+          iconAnchor: [20, 20]
+        });
+
+        const windMarker = L.marker([pt.lat, pt.lng], { icon: windIcon, interactive: false, zIndexOffset: 1000 });
+        windMarker.addTo(windArrowsLayerRef.current);
+      });
+    }
+
+    // Render NASA FIRMS fire hotspot detections across Punjab, Haryana, UP
+    if (firesLayerRef.current) {
+      firesLayerRef.current.clearLayers();
+      if (showFires && firesData?.fires) {
+        firesData.fires.forEach((fire) => {
+          if (!fire.latitude || !fire.longitude) return;
+          const frpScale = Math.min(1.35, Math.max(0.8, 0.8 + (fire.frp / 15.0) * 0.55));
+          const frpOpacity = Math.min(1.0, Math.max(0.75, 0.7 + (fire.frp / 15.0) * 0.3));
+
+          const fireIcon = L.divIcon({
+            className: 'custom-fire-marker',
+            html: `
+              <div style="transform: scale(${frpScale}); opacity: ${frpOpacity};" class="relative group cursor-pointer flex items-center justify-center">
+                <div class="w-6 h-6 rounded-full bg-gradient-to-tr from-amber-600 to-rose-500 border border-amber-300 flex items-center justify-center text-white shadow-lg shadow-orange-600/60 hover:scale-125 transition-transform">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="#fef08a" stroke="#b91c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+                  </svg>
+                </div>
+                <div class="absolute inset-0 rounded-full bg-orange-500 opacity-40 animate-ping -z-10"></div>
+              </div>
+            `,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+            popupAnchor: [0, -12]
+          });
+
+          const fireMarker = L.marker([fire.latitude, fire.longitude], { icon: fireIcon, zIndexOffset: 200 });
+          const firePopupHtml = `
+            <div class="p-1 min-w-[210px] text-slate-100 font-sans">
+              <div class="flex items-center justify-between gap-2 border-b border-slate-700/60 pb-2 mb-2">
+                <span class="text-xs font-bold px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-400 border border-orange-500/40 flex items-center gap-1">
+                  🔥 ${fire.state} Fire Hotspot
+                </span>
+                <span class="text-[10px] text-slate-400">NASA FIRMS</span>
+              </div>
+              <div class="space-y-1.5 text-xs text-slate-300">
+                <div class="flex justify-between">
+                  <span class="text-slate-400">Fire Radiative Power:</span>
+                  <span class="font-bold text-amber-400">${fire.frp} MW</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400">Detection Date:</span>
+                  <span class="font-medium text-slate-200">${fire.acq_date}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400">Detection Confidence:</span>
+                  <span class="font-medium text-emerald-400 capitalize">${fire.confidence === 'n' ? 'Nominal' : fire.confidence === 'h' ? 'High' : 'Standard'}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400">Sensor:</span>
+                  <span class="text-slate-200">VIIRS (SNPP / NOAA-20)</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400">Coordinates:</span>
+                  <span class="text-slate-400 font-mono text-[10px]">${fire.latitude.toFixed(3)}°N, ${fire.longitude.toFixed(3)}°E</span>
+                </div>
+              </div>
+            </div>
+          `;
+          fireMarker.bindPopup(firePopupHtml, { maxWidth: 260 });
+          fireMarker.addTo(firesLayerRef.current);
+        });
+      }
+    }
+  }, [stations, selectedStation?.name, navTab, selectedStepIdx, movementData, showFires, firesData]);
+
+  // Open Detailed Station Modal
+  const openStationModal = async (station) => {
+    setSelectedStation(station);
+    setModalStation(station);
+    setLoadingModal(true);
+    setStationReadings(null);
+    setForecastData(null);
+    setExplainData(null);
+    setActiveTab('current');
+
+    try {
+      const [currRes, fcRes, expRes] = await Promise.all([
+        fetch(`${API_BASE}/current/${encodeURIComponent(station.name)}`),
+        fetch(`${API_BASE}/forecast/${encodeURIComponent(station.name)}`),
+        fetch(`${API_BASE}/explain/${encodeURIComponent(station.name)}`)
+      ]);
+
+      if (currRes.ok) setStationReadings(await currRes.json());
+      if (fcRes.ok) setForecastData(await fcRes.json());
+      if (expRes.ok) setExplainData(await expRes.json());
+    } catch (e) {
+      console.error('Error fetching station details:', e);
+    } finally {
+      setLoadingModal(false);
+    }
+  };
+
+  // Top 5 Highest PM2.5 Stations
+  const top5Stations = useMemo(() => {
+    return [...stations]
+      .filter(s => s.latest_pm25 !== null && s.latest_pm25 > 0)
+      .sort((a, b) => b.latest_pm25 - a.latest_pm25)
+      .slice(0, 5);
+  }, [stations]);
+
+  const maxTop5PM = top5Stations.length > 0 ? top5Stations[0].latest_pm25 : 100;
+
+  // Processed Stations for Table View (Sortable & Filterable)
+  const allCities = useMemo(() => {
+    const set = new Set(stations.map(s => s.city || 'Delhi NCR'));
+    return ['ALL', ...Array.from(set).sort()];
+  }, [stations]);
+
+  const tableStations = useMemo(() => {
+    let result = stations.filter(st => {
+      const matchSearch = st.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                          (st.city && st.city.toLowerCase().includes(searchQuery.toLowerCase()));
+      const matchCity = stationFilterCity === 'ALL' || (st.city || 'Delhi NCR') === stationFilterCity;
+      return matchSearch && matchCity;
+    });
+
+    result.sort((a, b) => {
+      let valA = a[stationSortField];
+      let valB = b[stationSortField];
+
+      if (stationSortField === 'pm25') {
+        valA = a.latest_pm25 ?? -1;
+        valB = b.latest_pm25 ?? -1;
+      } else if (stationSortField === 'aqi') {
+        valA = a.latest_aqi ?? -1;
+        valB = b.latest_aqi ?? -1;
+      } else if (stationSortField === 'name') {
+        valA = a.name.toLowerCase();
+        valB = b.name.toLowerCase();
+      }
+
+      if (valA < valB) return stationSortAsc ? -1 : 1;
+      if (valA > valB) return stationSortAsc ? 1 : -1;
+      return 0;
+    });
+
+    return result;
+  }, [stations, searchQuery, stationFilterCity, stationSortField, stationSortAsc]);
+
+  // Dynamic 1-line SHAP summary
+  const generateExplainSummary = () => {
+    if (!explainData || !explainData.top_contributing_factors || explainData.top_contributing_factors.length === 0) {
+      return 'Analyzing environmental and meteorological influences...';
+    }
+    const factors = explainData.top_contributing_factors;
+    const f1 = factors[0];
+    const f2 = factors.length > 1 ? factors[1] : null;
+
+    const f1Name = FEATURE_DICTIONARY[f1.feature]?.label || f1.feature;
+    const f2Name = f2 ? (FEATURE_DICTIONARY[f2.feature]?.label || f2.feature) : '';
+
+    const f1Verb = f1.impact === 'increase' ? 'increasing' : 'decreasing';
+    const f2Verb = f2 ? (f2.impact === 'increase' ? 'increasing' : 'decreasing') : '';
+
+    if (f1.impact === 'increase' && (!f2 || f2.impact === 'increase')) {
+      return `PM2.5 is being pushed UP mainly by ${f1Name} (+${Math.abs(f1.shap_value)} µg/m³)${f2 ? ` and ${f2Name} (+${Math.abs(f2.shap_value)} µg/m³)` : ''}.`;
+    } else if (f1.impact === 'decrease' && (!f2 || f2.impact === 'decrease')) {
+      return `PM2.5 is being pushed DOWN mainly by ${f1Name} (-${Math.abs(f1.shap_value)} µg/m³)${f2 ? ` and ${f2Name} (-${Math.abs(f2.shap_value)} µg/m³)` : ''}.`;
+    } else {
+      return `PM2.5 is primarily driven by ${f1Name} (${f1Verb} by ${Math.abs(f1.shap_value)} µg/m³)${f2 ? ` along with ${f2Name} (${f2Verb} by ${Math.abs(f2.shap_value)} µg/m³)` : ''}.`;
+    }
+  };
+
+  const maxShapMagnitude = explainData?.top_contributing_factors
+    ? Math.max(...explainData.top_contributing_factors.map(f => Math.abs(f.shap_value)), 1.0)
+    : 1.0;
+
+  // Selected Station Metrics
+  const currentPM = selectedStation?.latest_pm25 ?? 36.0;
+  const currentAQI = selectedStation?.latest_aqi ?? 61;
+  const currentAQICat = selectedStation?.aqi_category ?? 'Satisfactory';
+  const currentTemp = dispersionData?.temperature_2m ?? 28.0;
+
+  return (
+    <div className="h-screen w-screen flex bg-[#0B1120] text-slate-100 font-sans overflow-hidden">
+      
+      {/* Left Navigation Sidebar */}
+      <aside className="w-16 lg:w-56 bg-[#0F172A] border-r border-slate-800 flex flex-col justify-between shrink-0 z-20">
+        <div>
+          {/* Logo */}
+          <div className="h-16 px-4 flex items-center gap-3 border-b border-slate-800">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20 shrink-0">
+              <Wind className="w-5 h-5 text-white" />
+            </div>
+            <div className="hidden lg:block">
+              <h1 className="font-extrabold text-sm text-white tracking-wide">VayuDrishti</h1>
+              <p className="text-[10px] text-cyan-400 font-medium">Air Intelligence</p>
+            </div>
+          </div>
+
+          {/* Navigation Items */}
+          <nav className="p-3 space-y-1.5 text-xs font-semibold">
+            <button
+              onClick={() => setNavTab('dashboard')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all ${
+                navTab === 'dashboard' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <LayoutDashboard className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Dashboard</span>
+            </button>
+
+            <button
+              onClick={() => setNavTab('stations')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all ${
+                navTab === 'stations' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <MapPin className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Stations (50)</span>
+              <span className="hidden lg:inline ml-auto text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
+                {stations.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                setNavTab('alerts');
+                fetchAlerts();
+              }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all relative ${
+                navTab === 'alerts' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <Bell className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Alerts & Rules</span>
+              {alertsData?.total_alerts > 0 && (
+                <span className="hidden lg:inline ml-auto text-[10px] px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold">
+                  {alertsData.total_alerts}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setNavTab('settings')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all ${
+                navTab === 'settings' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}>
+              <Settings className="w-4 h-4 shrink-0" />
+              <span className="hidden lg:inline">Settings</span>
+            </button>
+          </nav>
+        </div>
+
+        {/* Sidebar Footer Info */}
+        <div className="p-3 border-t border-slate-800 hidden lg:block text-[11px] text-slate-400">
+          <div className="flex items-center gap-1.5 text-emerald-400 font-medium mb-1">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span>Live ML Backend Active</span>
+          </div>
+          <p className="text-slate-500 text-[10px]">Model: XGBoost V1 | CPCB NAQI</p>
+        </div>
+      </aside>
+
+      {/* Main App Container */}
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        
+        {/* Top Header Bar */}
+        <header className="h-16 border-b border-slate-800 bg-[#0F172A]/90 backdrop-blur-md px-6 flex items-center justify-between shrink-0 z-10">
+          <div className="flex items-center gap-4">
+            <h2 className="text-base font-bold text-white font-heading">
+              {navTab === 'dashboard' && 'Delhi NCR Air Quality & Forecasting Intelligence'}
+              {navTab === 'stations' && 'Monitoring Stations Directory (50 Active Sensors)'}
+              {navTab === 'alerts' && 'Automated Air Quality Rules & Active Alerts'}
+              {navTab === 'settings' && 'System Configuration & Machine Learning Metadata'}
+            </h2>
+            {navTab === 'dashboard' && selectedStation && (
+              <span className="hidden md:inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 shadow-sm">
+                <MapPin className="w-3.5 h-3.5 text-cyan-400" />
+                Active Focus: <strong className="text-white">{selectedStation.name}</strong>
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button 
+              onClick={() => {
+                fetchStations();
+                if (navTab === 'alerts') fetchAlerts();
+              }}
+              disabled={loading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-xs font-semibold text-slate-200 transition-colors border border-slate-700/60">
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-cyan-400' : ''}`} />
+              <span className="hidden sm:inline">{loading ? 'Syncing...' : 'Sync Live Telemetry'}</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Dynamic Page Content Based on navTab */}
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+
+          {/* ========================================================================= */}
+          {/* PAGE 1: DASHBOARD                                                         */}
+          {/* ========================================================================= */}
+          {navTab === 'dashboard' && (
+            <>
+              {/* SECTION 1: Multi-line Trend Chart (Top) */}
+              <section>
+                <MultiLineTrendChart 
+                  historyData={historyData}
+                  days={historyDays}
+                  onDaysChange={(d) => setHistoryDays(d)}
+                  stationName={selectedStation?.name || 'Alipur, Delhi - DPCC'}
+                  onOpenModal={() => selectedStation && openStationModal(selectedStation)}
+                />
+              </section>
+
+              {/* SECTION 2: Compact Stat Cards Row */}
+              <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                {/* Card 1: PM2.5 */}
+                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-4 shadow-lg hover:border-slate-700 transition-all">
+                  <div className="flex items-center justify-between text-slate-400 text-xs mb-1 font-semibold">
+                    <span>Current PM2.5</span>
+                    <span className="p-1.5 rounded-lg bg-cyan-950/60 text-cyan-400 border border-cyan-500/20">
+                      <Wind className="w-3.5 h-3.5" />
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2 mt-2">
+                    <span className="text-2xl font-extrabold text-white">{currentPM}</span>
+                    <span className="text-xs text-slate-400">µg/m³</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-semibold mt-2">
+                    <TrendingDown className="w-3.5 h-3.5" />
+                    <span>Station Live Concentration</span>
+                  </div>
+                </div>
+
+                {/* Card 2: Temperature */}
+                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-4 shadow-lg hover:border-slate-700 transition-all">
+                  <div className="flex items-center justify-between text-slate-400 text-xs mb-1 font-semibold">
+                    <span>Ambient Temperature</span>
+                    <span className="p-1.5 rounded-lg bg-rose-950/60 text-rose-400 border border-rose-500/20">
+                      <Thermometer className="w-3.5 h-3.5" />
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2 mt-2">
+                    <span className="text-2xl font-extrabold text-white">{currentTemp}</span>
+                    <span className="text-xs text-slate-400">°C</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-rose-400 font-semibold mt-2">
+                    <TrendingUp className="w-3.5 h-3.5" />
+                    <span>Open-Meteo Regional Weather</span>
+                  </div>
+                </div>
+
+                {/* Card 3: Official CPCB AQI */}
+                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-4 shadow-lg hover:border-slate-700 transition-all">
+                  <div className="flex items-center justify-between text-slate-400 text-xs mb-1 font-semibold">
+                    <span>Official CPCB AQI</span>
+                    <span className="p-1.5 rounded-lg bg-amber-950/60 text-amber-400 border border-amber-500/20">
+                      <Gauge className="w-3.5 h-3.5" />
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2 mt-2">
+                    <span className="text-2xl font-extrabold text-white">{currentAQI}</span>
+                    <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${getPM25Theme(currentPM).badge}`}>
+                      {currentAQICat}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-2">
+                    NAQI Sub-Index Scale (0-500)
+                  </div>
+                </div>
+
+                {/* Card 4: Atmospheric Dispersion Status */}
+                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-4 shadow-lg hover:border-slate-700 transition-all">
+                  <div className="flex items-center justify-between text-slate-400 text-xs mb-1 font-semibold">
+                    <span>Atmospheric Dispersion</span>
+                    <span className="p-1.5 rounded-lg bg-blue-950/60 text-blue-400 border border-blue-500/20">
+                      <Activity className="w-3.5 h-3.5" />
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <span className="text-sm font-extrabold text-white block truncate">
+                      {dispersionData?.classification || 'MODERATE DISPERSION'}
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      PBL: {dispersionData?.boundary_layer_height || 450}m | Wind: {dispersionData?.wind_speed_10m || 8.0}m/s
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-emerald-400 font-semibold mt-1.5 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                    <span>Active Dispersion Ventilation</span>
+                  </div>
+                </div>
+              </section>
+
+              {/* SECTION 3 & 4: Leaflet Map & Top 5 Hotspots Bar Comparison */}
+              <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Map Container */}
+                <div className="lg:col-span-2 bg-[#0F172A] border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-2">
+                        <MapPin className="w-4 h-4 text-cyan-400" />
+                        <h3 className="font-bold text-sm text-white font-heading">
+                          Delhi NCR Active Station Network (50 Sensors)
+                        </h3>
+                      </div>
+
+                      {/* FIRMS Regional Fires Toggle Button */}
+                      <button
+                        onClick={() => {
+                          const nextState = !showFires;
+                          setShowFires(nextState);
+                          if (nextState && mapInstanceRef.current && firesData?.fires?.length > 0) {
+                            // If toggled on, expand view slightly so regional fires are in frame
+                            mapInstanceRef.current.flyTo([29.2, 76.5], 8, { duration: 0.8 });
+                          } else if (!nextState && mapInstanceRef.current) {
+                            mapInstanceRef.current.flyTo(DELHI_CENTER, 10, { duration: 0.8 });
+                          }
+                        }}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                          showFires
+                            ? 'bg-orange-500/20 text-orange-300 border border-orange-500/40 shadow-sm shadow-orange-500/10 ring-1 ring-orange-500/30'
+                            : 'bg-slate-900 text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-slate-800'
+                        }`}>
+                        <Flame className={`w-3.5 h-3.5 ${showFires ? 'text-orange-400 fill-orange-400' : 'text-slate-500'}`} />
+                        <span>Show Regional Fires</span>
+                        {firesData?.total_fires > 0 && (
+                          <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                            showFires ? 'bg-orange-500/30 text-orange-200' : 'bg-slate-800 text-slate-400'
+                          }`}>
+                            {firesData.total_fires}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+
+                    <div className="relative w-full sm:w-64">
+                      <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+                      <input 
+                        type="text"
+                        placeholder="Search station & press Enter..."
+                        value={mapSearchQuery}
+                        onFocus={() => setIsSearchDropdownOpen(true)}
+                        onChange={(e) => {
+                          setMapSearchQuery(e.target.value);
+                          setIsSearchDropdownOpen(true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            if (searchMatches.length > 0) {
+                              handleStationSearchSelect(searchMatches[0]);
+                            } else if (mapSearchQuery.trim()) {
+                              const q = mapSearchQuery.trim().toLowerCase();
+                              const match = stations.find(st => 
+                                st.name.toLowerCase().includes(q) || (st.city && st.city.toLowerCase().includes(q))
+                              );
+                              if (match) handleStationSearchSelect(match);
+                            }
+                          } else if (e.key === 'Escape') {
+                            setIsSearchDropdownOpen(false);
+                          }
+                        }}
+                        className="w-full pl-8 pr-7 py-1.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 shadow-inner"
+                      />
+
+                      {mapSearchQuery && (
+                        <button
+                          onClick={() => {
+                            setMapSearchQuery('');
+                            setIsSearchDropdownOpen(false);
+                          }}
+                          className="absolute right-2.5 top-2 text-slate-500 hover:text-slate-300">
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
+
+                      {/* Autocomplete Suggestions Dropdown */}
+                      {isSearchDropdownOpen && mapSearchQuery.trim() && (
+                        <div className="absolute left-0 right-0 top-full mt-1 bg-slate-950 border border-slate-700/80 rounded-xl shadow-2xl overflow-hidden z-50 divide-y divide-slate-800/80 max-h-64 overflow-y-auto">
+                          {searchMatches.length > 0 ? (
+                            searchMatches.map((st) => {
+                              const theme = getPM25Theme(st.latest_pm25);
+                              return (
+                                <div
+                                  key={st.name}
+                                  onClick={() => handleStationSearchSelect(st)}
+                                  className="px-3 py-2 hover:bg-slate-900 cursor-pointer flex items-center justify-between gap-2 transition-colors">
+                                  <div className="min-w-0">
+                                    <div className="text-xs font-bold text-slate-200 truncate">
+                                      {st.name}
+                                    </div>
+                                    <div className="text-[10px] text-slate-400">
+                                      {st.city || 'Delhi NCR'}
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    <span className="text-xs font-bold text-white">
+                                      {st.latest_pm25 !== null ? `${Math.round(st.latest_pm25)}` : '--'}
+                                    </span>
+                                    <span className={`text-[9px] px-1.5 py-0.2 rounded-full font-bold border ${theme.badge}`}>
+                                      AQI {st.latest_aqi || '--'}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })
+                          ) : (
+                            <div className="px-3 py-2 text-xs text-slate-500 text-center">
+                              No matching monitoring station found
+                            </div>
+                          )}
+                          <div className="px-3 py-1 bg-slate-900 text-[10px] text-slate-400 font-medium flex items-center justify-between">
+                            <span>Press <strong>Enter</strong> to trace & view</span>
+                            <span className="text-cyan-400 font-bold">&crarr;</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Caption for FIRMS Fires & Downwind Legend */}
+                  {showFires && (
+                    <div className="mb-2.5 px-3 py-2 rounded-xl bg-orange-950/30 border border-orange-500/25 flex flex-col gap-1 text-[11px] text-orange-300/90 shadow-sm">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold flex items-center gap-1.5">
+                          <span>🔥</span>
+                          <span>Regional Fire Activity (NASA FIRMS):</span>
+                        </span>
+                        <button 
+                          onClick={() => {
+                            if (mapInstanceRef.current) {
+                              mapInstanceRef.current.flyTo(DELHI_CENTER, 10, { duration: 0.8 });
+                            }
+                          }}
+                          className="text-[10px] text-cyan-400 hover:underline font-semibold shrink-0 ml-2">
+                          Recenter on Delhi
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-snug">
+                        Highlighted stations (amber dashed ring / 🔥) are geographically downwind of active regional fires under current wind conditions — not a confirmed pollution source, just a directional indicator.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="h-80 w-full rounded-xl overflow-hidden relative border border-slate-800">
+                    <div ref={mapContainerRef} className="w-full h-full z-0" />
+                  </div>
+
+                  {/* POLLUTION MOVEMENT TIME-SLIDER CONTROL & COMPASS GAUGE */}
+                  <div className="mt-4 pt-3.5 border-t border-slate-800/90 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800/80">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs font-bold text-white flex items-center gap-1.5 font-heading">
+                          <Wind className="w-4 h-4 text-cyan-400" />
+                          Pollution Movement Time-Slider
+                        </span>
+                        
+                        {/* Play / Pause Auto-Advance Button */}
+                        <button
+                          onClick={() => setIsPlayingMovement(!isPlayingMovement)}
+                          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all ${
+                            isPlayingMovement
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm shadow-amber-500/10'
+                              : 'bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/40 shadow-sm shadow-cyan-500/10'
+                          }`}>
+                          {isPlayingMovement ? (
+                            <>
+                              <Pause className="w-3 h-3 fill-amber-300" />
+                              <span>Pause Loop</span>
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-3 h-3 fill-cyan-300" />
+                              <span>Play Loop</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      {/* Visual Compass Wind Gauge & Telemetry Readout */}
+                      {movementData?.steps?.[selectedStepIdx] && (
+                        <div className="flex items-center gap-2.5">
+                          {/* Mini Rotating Compass Dial Widget */}
+                          <div className="flex items-center gap-2 px-2.5 py-1 rounded-xl bg-slate-900/90 border border-slate-700/80 shadow-md">
+                            <div className="relative w-6 h-6 rounded-full bg-slate-950 border border-cyan-500/40 flex items-center justify-center">
+                              <span className="absolute -top-1 text-[7px] font-black text-slate-500">N</span>
+                              <div 
+                                style={{ transform: `rotate(${movementData.steps[selectedStepIdx].wind.direction_deg}deg)` }}
+                                className="w-full h-full flex items-center justify-center transition-transform duration-700 pointer-events-none">
+                                <Navigation className="w-3.5 h-3.5 text-cyan-400 fill-cyan-400" />
+                              </div>
+                            </div>
+
+                            <div className="text-[11px] font-mono leading-tight">
+                              <div className="text-cyan-300 font-bold flex items-center gap-1">
+                                <span>{movementData.steps[selectedStepIdx].wind.speed_ms} m/s</span>
+                                <span className="text-slate-400 font-normal">({movementData.steps[selectedStepIdx].wind.direction_label})</span>
+                              </div>
+                              <div className="text-[9px] text-slate-400">
+                                {movementData.steps[selectedStepIdx].wind.direction_deg}° from N
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="hidden md:flex flex-col justify-center px-2.5 py-1 rounded-xl bg-slate-900/90 border border-slate-700/80 font-mono text-[11px]">
+                            <span className="text-slate-400 text-[9px]">Forecast Avg</span>
+                            <span className="text-white font-bold">
+                              {(movementData.steps[selectedStepIdx].stations.reduce((a, b) => a + b.pm25, 0) / movementData.steps[selectedStepIdx].stations.length).toFixed(1)} µg/m³
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Step Buttons & Range Slider */}
+                    <div className="grid grid-cols-6 gap-1.5 mb-2">
+                      {['Now', '+6h', '+12h', '+24h', '+48h', '+72h'].map((stepLabel, idx) => {
+                        const isCurrent = selectedStepIdx === idx;
+                        return (
+                          <button
+                            key={stepLabel}
+                            onClick={() => {
+                              setSelectedStepIdx(idx);
+                              setIsPlayingMovement(false);
+                            }}
+                            className={`py-1 px-1 rounded-lg text-xs font-bold transition-all text-center ${
+                              isCurrent
+                                ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/30 ring-1 ring-cyan-300'
+                                : 'bg-slate-900 text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-slate-800'
+                            }`}>
+                            {stepLabel}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Disclaimer Footnote */}
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mt-1">
+                      <span className="italic">
+                        ℹ️ AI-assisted pollution transport estimate based on forecasted conditions
+                      </span>
+                      <span className="text-slate-400 font-mono">
+                        {movementData?.steps?.[selectedStepIdx]?.label === 'Now' ? 'Live Observations' : `Projected +${movementData?.steps?.[selectedStepIdx]?.offset_hours || 0}h Ahead`}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right-Side Panel: Top 5 Highest PM2.5 Stations */}
+                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
+                  <div>
+                    <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
+                      <div className="flex items-center gap-2">
+                        <ShieldAlert className="w-4 h-4 text-rose-400" />
+                        <h3 className="font-bold text-sm text-white font-heading">
+                          Top 5 Pollution Hotspots
+                        </h3>
+                      </div>
+                      <span className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">Live Ranking</span>
+                    </div>
+
+                    <div className="space-y-3">
+                      {top5Stations.map((st, idx) => {
+                        const isSelected = selectedStation?.name === st.name;
+                        const theme = getPM25Theme(st.latest_pm25);
+                        const barWidth = Math.max(15, Math.round((st.latest_pm25 / maxTop5PM) * 100));
+
+                        return (
+                          <div 
+                            key={st.name} 
+                            onClick={() => {
+                              setSelectedStation(st);
+                              if (mapInstanceRef.current && st.latitude && st.longitude) {
+                                mapInstanceRef.current.flyTo([st.latitude, st.longitude], 11, { duration: 0.8 });
+                              }
+                            }}
+                            className={`p-2.5 rounded-xl transition-all cursor-pointer group ${
+                              isSelected 
+                                ? 'bg-cyan-950/40 border-2 border-cyan-500 shadow-lg shadow-cyan-500/10' 
+                                : 'bg-slate-950/70 border border-slate-800/80 hover:border-slate-700'
+                            }`}>
+                            
+                            <div className="flex items-center justify-between text-xs mb-1.5">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className={`w-4 h-4 rounded-full text-[10px] font-bold flex items-center justify-center shrink-0 ${
+                                  isSelected ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-slate-300'
+                                }`}>
+                                  {idx + 1}
+                                </span>
+                                <span className={`font-semibold truncate transition-colors ${
+                                  isSelected ? 'text-cyan-300' : 'text-slate-200 group-hover:text-cyan-400'
+                                }`}>
+                                  {st.name.split(',')[0]}
+                                </span>
+                              </div>
+                              <span className={`font-bold text-xs ${theme.text}`}>
+                                {st.latest_pm25} µg/m³
+                              </span>
+                            </div>
+
+                            <div className="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden">
+                              <div 
+                                style={{ width: `${barWidth}%` }}
+                                className={`h-full rounded-full transition-all duration-500 ${
+                                  st.latest_pm25 > 100 ? 'bg-gradient-to-r from-orange-500 to-rose-500' : 'bg-gradient-to-r from-amber-400 to-orange-400'
+                                }`}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="text-[11px] text-slate-400 pt-3 border-t border-slate-800/80 mt-4 flex items-center justify-between">
+                    <span>Updated from CPCB & OpenAQ</span>
+                    <span 
+                      className="text-cyan-400 font-semibold flex items-center gap-1 cursor-pointer hover:underline" 
+                      onClick={() => openStationModal(selectedStation || top5Stations[0])}>
+                      Open Intelligence Modal &rarr;
+                    </span>
+                  </div>
+                </div>
+              </section>
+            </>
+          )}
+
+          {/* ========================================================================= */}
+          {/* PAGE 2: STATIONS (FULL SEARCHABLE & SORTABLE DIRECTORY)                    */}
+          {/* ========================================================================= */}
+          {navTab === 'stations' && (
+            <div className="space-y-6">
+              
+              {/* Directory Filter & Search Header */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div>
+                    <h3 className="text-base font-bold text-white font-heading">
+                      Delhi NCR Monitoring Stations Directory
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Real-time observations from DPCC, CPCB, HSPCB, UPPCB, and IMD sensors
+                    </p>
+                  </div>
+
+                  {/* Search and City Filter Controls */}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="relative min-w-[220px]">
+                      <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+                      <input 
+                        type="text"
+                        placeholder="Search station..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="w-full pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                      />
+                    </div>
+
+                    <select
+                      value={stationFilterCity}
+                      onChange={(e) => setStationFilterCity(e.target.value)}
+                      className="bg-slate-950 border border-slate-800 text-xs text-slate-200 px-3 py-1.5 rounded-xl focus:outline-none focus:border-cyan-500 font-medium">
+                      {allCities.map(c => (
+                        <option key={c} value={c}>{c === 'ALL' ? 'All NCR Cities' : c}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Stations Summary Stat Bar */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 pt-4 border-t border-slate-800/80 text-xs">
+                  <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                    <span className="text-slate-400 block">Total Active Stations</span>
+                    <span className="text-lg font-bold text-white mt-0.5 block">{stations.length}</span>
+                  </div>
+                  <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                    <span className="text-slate-400 block">Average PM2.5</span>
+                    <span className="text-lg font-bold text-cyan-400 mt-0.5 block">
+                      {stations.length ? Math.round(stations.reduce((a, b) => a + (b.latest_pm25 || 0), 0) / stations.length) : '--'} µg/m³
+                    </span>
+                  </div>
+                  <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                    <span className="text-slate-400 block">Highest PM2.5 Hotspot</span>
+                    <span className="text-lg font-bold text-rose-400 mt-0.5 block truncate">
+                      {top5Stations[0]?.latest_pm25 || '--'} µg/m³ ({top5Stations[0]?.name.split(',')[0]})
+                    </span>
+                  </div>
+                  <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800/80">
+                    <span className="text-slate-400 block">Lowest PM2.5 Reading</span>
+                    <span className="text-lg font-bold text-emerald-400 mt-0.5 block">
+                      {Math.min(...stations.filter(s => s.latest_pm25 > 0).map(s => s.latest_pm25)) || '--'} µg/m³
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Stations Full Table */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-950/80 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
+                      <tr>
+                        <th 
+                          onClick={() => {
+                            if (stationSortField === 'name') setStationSortAsc(!stationSortAsc);
+                            else { setStationSortField('name'); setStationSortAsc(true); }
+                          }}
+                          className="px-5 py-3.5 cursor-pointer hover:text-white transition-colors">
+                          <div className="flex items-center gap-1.5">
+                            <span>Station Name & Network</span>
+                            <ArrowUpDown className="w-3 h-3" />
+                          </div>
+                        </th>
+                        <th className="px-4 py-3.5">City / Region</th>
+                        <th 
+                          onClick={() => {
+                            if (stationSortField === 'pm25') setStationSortAsc(!stationSortAsc);
+                            else { setStationSortField('pm25'); setStationSortAsc(false); }
+                          }}
+                          className="px-4 py-3.5 cursor-pointer hover:text-white transition-colors">
+                          <div className="flex items-center gap-1.5">
+                            <span>PM2.5 (µg/m³)</span>
+                            <ArrowUpDown className="w-3 h-3" />
+                          </div>
+                        </th>
+                        <th 
+                          onClick={() => {
+                            if (stationSortField === 'aqi') setStationSortAsc(!stationSortAsc);
+                            else { setStationSortField('aqi'); setStationSortAsc(false); }
+                          }}
+                          className="px-4 py-3.5 cursor-pointer hover:text-white transition-colors">
+                          <div className="flex items-center gap-1.5">
+                            <span>Official CPCB AQI</span>
+                            <ArrowUpDown className="w-3 h-3" />
+                          </div>
+                        </th>
+                        <th className="px-4 py-3.5">Dispersion Indicator</th>
+                        <th className="px-5 py-3.5 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {tableStations.map((st, idx) => {
+                        const theme = getPM25Theme(st.latest_pm25);
+                        const isSelected = selectedStation?.name === st.name;
+
+                        return (
+                          <tr 
+                            key={st.name} 
+                            className={`hover:bg-slate-800/40 transition-colors ${isSelected ? 'bg-cyan-950/20' : ''}`}>
+                            
+                            <td className="px-5 py-3.5">
+                              <div className="font-bold text-white flex items-center gap-2">
+                                <span className="w-5 h-5 rounded bg-slate-800 text-[10px] flex items-center justify-center text-slate-400 font-mono">
+                                  {idx + 1}
+                                </span>
+                                <span>{st.name}</span>
+                              </div>
+                              <span className="text-[11px] text-slate-500 block ml-7">
+                                Lat: {st.latitude ? st.latitude.toFixed(4) : '--'}, Lon: {st.longitude ? st.longitude.toFixed(4) : '--'}
+                              </span>
+                            </td>
+
+                            <td className="px-4 py-3.5 text-slate-300 font-medium">
+                              {st.city || 'Delhi NCR'}
+                            </td>
+
+                            <td className="px-4 py-3.5">
+                              <span className={`text-sm font-extrabold ${theme.text}`}>
+                                {st.latest_pm25 !== null ? st.latest_pm25 : '--'} <span className="text-[10px] text-slate-400 font-normal">µg/m³</span>
+                              </span>
+                            </td>
+
+                            <td className="px-4 py-3.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-bold text-white">{st.latest_aqi || '--'}</span>
+                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${theme.badge}`}>
+                                  {st.aqi_category || theme.label}
+                                </span>
+                              </div>
+                            </td>
+
+                            <td className="px-4 py-3.5">
+                              <span className="text-[11px] px-2 py-0.5 rounded-md bg-blue-950/50 text-blue-300 border border-blue-500/20 font-semibold">
+                                Atmospheric Mixing Active
+                              </span>
+                            </td>
+
+                            <td className="px-5 py-3.5 text-right">
+                              <button
+                                onClick={() => {
+                                  setSelectedStation(st);
+                                  setNavTab('dashboard');
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-semibold text-xs transition-all shadow-md shadow-cyan-600/20">
+                                Focus on Dashboard &rarr;
+                              </button>
+                            </td>
+
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+            </div>
+          )}
+
+          {/* ========================================================================= */}
+          {/* PAGE 3: ALERTS & RULES                                                    */}
+          {/* ========================================================================= */}
+          {navTab === 'alerts' && (
+            <div className="space-y-6">
+              
+              {/* Alerts Rule Engine Card */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="w-5 h-5 text-amber-400" />
+                      <h3 className="text-base font-bold text-white font-heading">
+                        Real-Time Threshold Alert Engine
+                      </h3>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Evaluated continuously across all 50 Delhi NCR stations using live telemetry and XGBoost forecasts
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs px-3 py-1 rounded-full bg-slate-950 border border-slate-800 text-slate-300 font-semibold">
+                      Total Active: <strong className="text-amber-400">{alertsData?.total_alerts || 0}</strong>
+                    </span>
+                  </div>
+                </div>
+
+                {/* 3 Automated Rules Summary Banner */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                    <div className="font-bold text-rose-400 mb-1 flex items-center gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5" />
+                      <span>Rule 1: Poor AQI Alert</span>
+                    </div>
+                    <p className="text-slate-400 text-[11px]">
+                      Triggers when station AQI exceeds 200 (Poor, Very Poor, or Severe categories).
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                    <div className="font-bold text-amber-400 mb-1 flex items-center gap-1.5">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      <span>Rule 2: Rising Pollution Trend</span>
+                    </div>
+                    <p className="text-slate-400 text-[11px]">
+                      Triggers when 12-hour predicted PM2.5 climbs &ge; +20% AND crosses into Moderate or worse.
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                    <div className="font-bold text-blue-400 mb-1 flex items-center gap-1.5">
+                      <Activity className="w-3.5 h-3.5" />
+                      <span>Rule 3: Poor Dispersion / Inversion</span>
+                    </div>
+                    <p className="text-slate-400 text-[11px]">
+                      Triggers when surface winds &lt; 2.0 m/s and mixing height &lt; 500 m trap surface emissions.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Live Triggered Alerts List */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
+                  <h4 className="font-bold text-sm text-white">Live Triggered Station Alerts</h4>
+                  <span className="text-[11px] text-slate-400">
+                    Updated: {new Date(alertsData?.timestamp || Date.now()).toLocaleTimeString()}
+                  </span>
+                </div>
+
+                {loadingAlerts ? (
+                  <div className="py-12 text-center text-xs text-slate-500">
+                    <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-cyan-500" />
+                    Evaluating multi-station alert rules...
+                  </div>
+                ) : alertsData?.alerts && alertsData.alerts.length > 0 ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                    {alertsData.alerts.map((alt) => {
+                      const isCrit = alt.severity === 'critical';
+                      return (
+                        <div 
+                          key={alt.id}
+                          className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 hover:border-slate-700 transition-all flex flex-col justify-between">
+                          <div>
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                              <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider border ${
+                                isCrit 
+                                  ? 'bg-rose-950 text-rose-300 border-rose-500/40' 
+                                  : 'bg-amber-950 text-amber-300 border-amber-500/40'
+                              }`}>
+                                {alt.alert_type}
+                              </span>
+                              <span className="text-[11px] text-slate-400 font-semibold">{alt.city}</span>
+                            </div>
+
+                            <h5 className="font-bold text-sm text-white mb-1.5">{alt.station_name}</h5>
+                            <div className="text-xs font-semibold text-cyan-300 mb-2">
+                              Current / Forecast Value: {alt.current_value}
+                            </div>
+                            <p className="text-xs text-slate-300 leading-relaxed">
+                              {alt.reason}
+                            </p>
+                          </div>
+
+                          <div className="mt-4 pt-3 border-t border-slate-800/80 flex items-center justify-between">
+                            <span className="text-[10px] text-slate-500">Auto Rule Trigger</span>
+                            <button
+                              onClick={() => {
+                                const stObj = stations.find(s => s.name === alt.station_name) || { name: alt.station_name, city: alt.city };
+                                setSelectedStation(stObj);
+                                setNavTab('dashboard');
+                              }}
+                              className="text-xs font-bold text-cyan-400 hover:text-cyan-300 flex items-center gap-1">
+                              <span>Investigate Station</span> &rarr;
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  /* No active alerts state */
+                  <div className="py-14 text-center">
+                    <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto mb-3 opacity-90" />
+                    <h5 className="text-base font-bold text-white mb-1">No Active Alerts Right Now</h5>
+                    <p className="text-xs text-slate-400 max-w-md mx-auto">
+                      All 50 Delhi NCR monitoring stations are operating within safe baseline thresholds with active atmospheric dispersion.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+            </div>
+          )}
+
+          {/* ========================================================================= */}
+          {/* PAGE 4: SETTINGS & METADATA                                               */}
+          {/* ========================================================================= */}
+          {navTab === 'settings' && (
+            <div className="space-y-6 max-w-4xl">
+              
+              {/* Settings Card 1: Polling Frequency */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center gap-2 mb-3">
+                  <Clock className="w-5 h-5 text-cyan-400" />
+                  <h3 className="text-base font-bold text-white font-heading">
+                    Live Telemetry Polling Frequency
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-400 mb-4">
+                  Configure how frequently the dashboard requests updated station observations and forecast status from the FastAPI backend.
+                </p>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {[
+                    { label: '30 Seconds', val: 30 },
+                    { label: '60 Seconds (Default)', val: 60 },
+                    { label: '5 Minutes', val: 300 },
+                    { label: 'Manual Refresh Only', val: 0 }
+                  ].map((opt) => (
+                    <button
+                      key={opt.val}
+                      onClick={() => setRefreshIntervalSec(opt.val)}
+                      className={`p-3 rounded-xl border text-xs font-semibold transition-all text-center ${
+                        refreshIntervalSec === opt.val
+                          ? 'bg-cyan-950/60 border-cyan-500 text-cyan-300 shadow-md shadow-cyan-500/20'
+                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                      }`}>
+                      <div>{opt.label}</div>
+                      {refreshIntervalSec === opt.val && (
+                        <div className="text-[10px] text-cyan-400 font-normal mt-1">Active Setting</div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="mt-4 pt-3 border-t border-slate-800/80 text-[11px] text-slate-400 flex items-center justify-between">
+                  <span>Last successful synchronization: {lastSyncTime.toLocaleTimeString()}</span>
+                  <span className="text-emerald-400 font-semibold flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Polling Hook Active
+                  </span>
+                </div>
+              </div>
+
+              {/* Settings Card 2: ML Model Information */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center gap-2 mb-3">
+                  <Cpu className="w-5 h-5 text-purple-400" />
+                  <h3 className="text-base font-bold text-white font-heading">
+                    Machine Learning Architecture (Production V1)
+                  </h3>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <span className="text-slate-400 block font-semibold mb-1">Model Class & Target</span>
+                    <p className="text-white font-bold">XGBoost Regressor (100 Trees, Depth 6)</p>
+                    <p className="text-slate-400 text-[11px] mt-1">
+                      Multi-step autoregressive projection with hour-by-hour lag updates across a 72-hour forecast horizon.
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <span className="text-slate-400 block font-semibold mb-1">Training Dataset & Performance</span>
+                    <p className="text-white font-bold">90-Day Delhi NCR Master Dataset</p>
+                    <p className="text-slate-400 text-[11px] mt-1">
+                      74,175 training rows, 18,544 test holdout rows. Evaluated Test MAE: 10.29 µg/m³, Test R²: 0.574.
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 md:col-span-2">
+                    <span className="text-slate-400 block font-semibold mb-1">28 Input Features</span>
+                    <p className="text-slate-300 text-[11px] leading-relaxed">
+                      <code>pm25_value</code>, 5 temporal lags (<code>lag_1, 3, 6, 12, 24</code>), 4 rolling windows (<code>roll_3, 6, 12, 24</code>), 8 meteorological inputs (<code>temperature, humidity, wind_speed, wind_sin, wind_cos, pressure, precipitation, PBL mixing height</code>), 4 satellite fire anomalies (<code>Punjab, Haryana, UP, Delhi</code>), 4 calendar temporal cyclic IDs, and spatial coordinates.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Settings Card 3: Data Sources & Attribution */}
+              <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl">
+                <div className="flex items-center gap-2 mb-3">
+                  <Database className="w-5 h-5 text-emerald-400" />
+                  <h3 className="text-base font-bold text-white font-heading">
+                    Data Source Attribution & Transparency
+                  </h3>
+                </div>
+
+                <div className="space-y-3 text-xs">
+                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <div className="font-bold text-white mb-0.5">OpenAQ Community API (v3)</div>
+                    <p className="text-slate-400 text-[11px]">
+                      Provides 15-minute sub-hourly ground monitoring station telemetry across 50 locations in Delhi NCR.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <div className="font-bold text-white mb-0.5">Open-Meteo Weather API & 72h Forecast</div>
+                    <p className="text-slate-400 text-[11px]">
+                      Delivers hourly regional temperature, humidity, wind vectors, surface pressure, and boundary layer mixing height without rate limits.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <div className="font-bold text-white mb-0.5">NASA FIRMS (VIIRS / MODIS)</div>
+                    <p className="text-slate-400 text-[11px]">
+                      Thermal anomaly satellite detections for crop residue stubble burning across Punjab, Haryana, Uttar Pradesh, and Delhi NCR.
+                    </p>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+                    <div className="font-bold text-white mb-0.5">Central Pollution Control Board (CPCB / DPCC)</div>
+                    <p className="text-slate-400 text-[11px]">
+                      Official national monitoring network and standard NAQI breakpoints. (Note: Subject to periodic sensor maintenance and telemetry transmission latency).
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          )}
+
+        </div>
+
+      </div>
+
+      {/* Station Detail Intelligence Modal */}
+      {modalStation && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#0F172A] border border-slate-800 rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl flex flex-col max-h-[88vh] animate-in fade-in zoom-in duration-200">
+            
+            {/* Modal Header */}
+            <div className="p-5 border-b border-slate-800 flex items-start justify-between bg-[#0F172A]/90">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-500/30">
+                    {modalStation.city || 'Delhi NCR'}
+                  </span>
+                  {modalStation.latest_pm25 && (
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${getPM25Theme(modalStation.latest_pm25).badge}`}>
+                      PM2.5: {modalStation.latest_pm25} µg/m³ (AQI: {modalStation.latest_aqi || '--'})
+                    </span>
+                  )}
+                </div>
+                <h3 className="text-lg font-bold text-white font-heading">{modalStation.name}</h3>
+              </div>
+              <button 
+                onClick={() => setModalStation(null)}
+                className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition-colors">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Tabs */}
+            <div className="flex border-b border-slate-800 bg-slate-950/50 px-5 pt-3 gap-4 text-xs font-semibold">
+              <button 
+                onClick={() => setActiveTab('current')}
+                className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                  activeTab === 'current' ? 'border-cyan-500 text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}>
+                <Activity className="w-3.5 h-3.5" />
+                <span>Current Sensor Readings</span>
+              </button>
+              <button 
+                onClick={() => setActiveTab('forecast')}
+                className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                  activeTab === 'forecast' ? 'border-cyan-500 text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}>
+                <TrendingUp className="w-3.5 h-3.5" />
+                <span>72-Hour Forecast (AI & Weather)</span>
+              </button>
+              <button 
+                onClick={() => setActiveTab('explain')}
+                className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                  activeTab === 'explain' ? 'border-cyan-500 text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}>
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                <span>Why is pollution changing?</span>
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto flex-1">
+              {loadingModal ? (
+                <div className="py-12 text-center text-xs text-slate-500">
+                  <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-cyan-500" />
+                  Fetching live telemetry & AI models from backend...
+                </div>
+              ) : activeTab === 'current' ? (
+                <div>
+                  <div className="text-xs text-slate-400 mb-3 flex items-center justify-between">
+                    <span>Telemetry for {stationReadings?.readings_count || 0} environmental parameters</span>
+                    <span>Source: OpenAQ / CPCB Sensor Feed</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {stationReadings?.readings?.map((r, i) => (
+                      <div key={i} className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                        <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">{r.parameter}</div>
+                        <div className="text-lg font-bold text-white mt-1">
+                          {r.value} <span className="text-xs text-slate-400 font-normal">{r.unit}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-1">
+                          {r.timestamp ? new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Live'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : activeTab === 'forecast' ? (
+                <div>
+                  <div className="p-3 bg-cyan-950/30 border border-cyan-500/30 rounded-xl text-cyan-300 text-xs mb-4 flex items-center gap-2">
+                    <Info className="w-4 h-4 shrink-0" />
+                    <span>{forecastData?.note || '72-hour forecast based on XGBoost autoregressive simulation.'}</span>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold text-slate-300 mb-2">Hourly Trajectory Preview (Next 72 Hours)</div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 max-h-72 overflow-y-auto pr-1">
+                      {forecastData?.forecast?.map((fc, i) => {
+                        const theme = getPM25Theme(fc.predicted_pm25);
+                        return (
+                          <div key={i} className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs">
+                            <div className="text-[11px] text-slate-400 flex items-center justify-between">
+                              <span>+ {fc.hour_offset}h</span>
+                              <span className={`text-[10px] px-1.5 py-0.2 rounded font-semibold ${theme.badge}`}>
+                                AQI {fc.predicted_aqi}
+                              </span>
+                            </div>
+                            <div className="text-base font-bold text-white mt-1">
+                              {fc.predicted_pm25} <span className="text-[10px] text-slate-400 font-normal">µg/m³</span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-0.5 flex items-center justify-between">
+                              <span>{new Date(fc.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit' })}</span>
+                              <span className="text-[9px] text-slate-500">{fc.aqi_category}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* "Why is pollution changing?" SHAP Explainability Tab */
+                <div className="space-y-4">
+                  <div className="p-4 bg-gradient-to-r from-slate-950 via-[#0F172A] to-cyan-950/40 border border-cyan-500/40 rounded-xl shadow-lg">
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <Sparkles className="w-4 h-4 text-amber-400" />
+                      <span className="text-xs font-bold text-cyan-300 uppercase tracking-wider">AI Feature Attribution</span>
+                      <span className="text-[11px] text-slate-400 ml-auto">
+                        Expected Base: {explainData?.base_expected_value || 42.9} µg/m³
+                      </span>
+                    </div>
+                    <p className="text-sm font-semibold text-slate-100 leading-snug">
+                      {generateExplainSummary()}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center justify-between text-xs text-slate-400 pt-1">
+                    <span className="font-semibold text-slate-300">Top Contributing Factors (SHAP Feature Attribution)</span>
+                    <span>Sorted by absolute impact magnitude</span>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    {explainData?.top_contributing_factors?.map((factor, idx) => {
+                      const meta = FEATURE_DICTIONARY[factor.feature] || {
+                        label: factor.feature,
+                        unit: '',
+                        icon: '🔹',
+                        desc: ''
+                      };
+
+                      const isIncrease = factor.impact === 'increase';
+                      const absShap = Math.abs(factor.shap_value);
+                      const barPercent = Math.min(100, Math.max(10, Math.round((absShap / maxShapMagnitude) * 100)));
+
+                      return (
+                        <div 
+                          key={idx} 
+                          className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 hover:border-slate-700 transition-colors">
+                          <div className="flex items-center justify-between gap-3 mb-1.5">
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <span className="text-base shrink-0">{meta.icon}</span>
+                              <div className="truncate">
+                                <div className="text-xs font-bold text-slate-200 truncate">
+                                  {meta.label}
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                  Current reading: <span className="font-semibold text-slate-300">{factor.value} {meta.unit}</span>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="text-right shrink-0">
+                              <div className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold ${
+                                isIncrease 
+                                  ? 'bg-rose-950/80 text-rose-300 border border-rose-500/30' 
+                                  : 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/30'
+                              }`}>
+                                {isIncrease ? (
+                                  <>
+                                    <ArrowUpRight className="w-3.5 h-3.5 text-rose-400" />
+                                    <span>+{factor.shap_value} µg/m³ (pushing UP)</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <ArrowDownRight className="w-3.5 h-3.5 text-emerald-400" />
+                                    <span>{factor.shap_value} µg/m³ (pushing DOWN)</span>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden mt-2">
+                            <div 
+                              style={{ width: `${barPercent}%` }}
+                              className={`h-full rounded-full transition-all duration-500 ${
+                                isIncrease ? 'bg-gradient-to-r from-orange-500 to-rose-500' : 'bg-gradient-to-r from-teal-500 to-emerald-500'
+                              }`}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="text-[11px] text-slate-400 bg-slate-950/40 p-3 rounded-lg border border-slate-800/60 flex items-start gap-2">
+                    <HelpCircle className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+                    <span>
+                      Shapley (SHAP) values quantify how much each environmental feature raises or lowers the predicted PM2.5 relative to regional baseline atmospheric conditions.
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex justify-end">
+              <button 
+                onClick={() => setModalStation(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-colors">
+                Close
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

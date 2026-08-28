@@ -9,3 +9,6 @@ node_modules/
 .venv/
 models/*.pkl
 !models/.gitkeep
+dist/
+frontend/dist/
+*.log
