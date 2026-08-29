@@ -639,55 +639,48 @@ def get_current_station_readings(station_name: str):
         readings=readings
     )
 
-
-@app.get("/forecast/{station_name}", response_model=ForecastResponse, summary="Get 72-Hour PM2.5 Forecast (XGBoost ML)")
-def get_forecast_for_station(station_name: str):
-    """
-    Generates a 72-hour forecast for the station using the trained XGBoost model,
-    real Open-Meteo hour-by-hour forecast weather, and official CPCB AQI.
-    """
-    decoded_name = urllib.parse.unquote(station_name).strip()
-    df_raw = load_raw_data()
-    coords_map = get_station_coordinates_map()
-
-    # Find station in current readings
-    matched = df_raw[df_raw["location"].str.strip().str.lower() == decoded_name.lower()]
-    if matched.empty:
-        matched = df_raw[df_raw["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
-
-    if not matched.empty:
-        actual_name = str(matched["location"].iloc[0])
-        city = str(matched["city"].iloc[0]) if "city" in matched.columns else "Delhi NCR"
-        pm25_row = matched[matched["parameter"].astype(str).str.lower() == "pm25"]
-        baseline_pm25 = float(pm25_row["value"].iloc[0]) if (not pm25_row.empty and pd.notna(pm25_row["value"].iloc[0])) else 50.0
-    else:
-        actual_name = decoded_name
-        city = "Delhi NCR"
-        baseline_pm25 = 50.0
-
-    coords = coords_map.get(actual_name, {"latitude": 28.6139, "longitude": 77.2090})
-    st_lat = coords.get("latitude", 28.6139)
-    st_lon = coords.get("longitude", 77.2090)
-
-    now_utc = datetime.now(timezone.utc)
+def generate_autoregressive_forecast(
+    current_pm: float,
+    now_utc: datetime,
+    is_using_real_model: bool,
+    forecast_weather_df: Optional[pd.DataFrame],
+    st_lat: float,
+    st_lon: float,
+    hours: int = 72,
+    static_weather: Optional[dict] = None,
+    enable_feedback: bool = False,
+    simulation_mode: bool = False
+) -> List[ForecastHour]:
+    from backend.aerosol_feedback import apply_feedback
+    
     forecast_list = []
-    is_using_real_model = (xgb_model is not None)
-    forecast_weather_df = load_forecast_weather()
+    pm_history = [current_pm] * 25
 
-    # Autoregressive multi-step projection with XGBoost
-    current_pm = max(5.0, baseline_pm25)
-    current_aqi_num, current_aqi_cat = pm25_to_aqi(current_pm)
-    pm_history = [current_pm] * 25  # for lags
-
-    for h in range(1, 73):
+    for h in range(1, hours + 1):
         fc_time = now_utc + timedelta(hours=h)
         hour_val = fc_time.hour
         day_val = fc_time.day
         month_val = fc_time.month
         dow_val = fc_time.weekday()
 
-        # Use real forecasted weather if available
-        if forecast_weather_df is not None and (h - 1) < len(forecast_weather_df):
+        if static_weather:
+            temp = float(static_weather.get("temperature", 28.0))
+            humidity = float(static_weather.get("humidity", 65.0))
+            wind_spd = float(static_weather.get("wind_speed", 8.0))
+            wdir = float(static_weather.get("wind_direction", 270.0))
+            wind_sin = math.sin(math.radians(wdir))
+            wind_cos = math.cos(math.radians(wdir))
+            pressure = 980.0
+            precip = float(static_weather.get("precipitation", 0.0))
+            blh_base = float(static_weather.get("pbl", 450.0))
+            
+            if simulation_mode:
+                diurnal = math.sin(2 * math.pi * (hour_val - 8) / 24)
+                temp = temp + (2.0 * diurnal)
+                blh = max(50.0, blh_base + (blh_base * 0.2 * diurnal))
+            else:
+                blh = blh_base
+        elif forecast_weather_df is not None and (h - 1) < len(forecast_weather_df):
             w_row = forecast_weather_df.iloc[h - 1]
             temp = float(w_row.get("temperature_2m", 28.0))
             humidity = float(w_row.get("relative_humidity_2m", 65.0))
@@ -708,7 +701,10 @@ def get_forecast_for_station(station_name: str):
             precip = 0.0
             blh = max(100.0, 450.0 + 300.0 * diurnal)
 
-        if is_using_real_model:
+        if enable_feedback:
+            blh = apply_feedback(pm_history[-1], wind_spd, blh)
+
+        if is_using_real_model and xgb_model is not None:
             feature_row = {
                 "pm25_value": float(pm_history[-1]),
                 "pm25_lag_1": float(pm_history[-1]),
@@ -758,6 +754,122 @@ def get_forecast_for_station(station_name: str):
                 aqi_category=aqi_cat
             )
         )
+    return forecast_list
+
+
+class SimulationRequest(BaseModel):
+    pm25: float
+    wind_speed: float
+    wind_direction: float
+    temperature: float
+    humidity: float
+    pbl: float
+    precipitation: float
+    enable_feedback: bool
+
+class SimulationResponse(BaseModel):
+    baseline_forecast: List[float]
+    feedback_forecast: List[float]
+    hour_offset: List[int]
+    message: str
+
+@app.post("/simulate", response_model=SimulationResponse, summary="Test hypothetical pollution scenarios with aerosol feedback")
+def simulate_scenario(req: SimulationRequest):
+    now_utc = datetime.now(timezone.utc)
+    st_lat = 28.6139
+    st_lon = 77.2090
+    
+    static_weather = {
+        "temperature": req.temperature,
+        "humidity": req.humidity,
+        "wind_speed": req.wind_speed,
+        "wind_direction": req.wind_direction,
+        "pbl": req.pbl,
+        "precipitation": req.precipitation
+    }
+    
+    baseline = generate_autoregressive_forecast(
+        current_pm=req.pm25,
+        now_utc=now_utc,
+        is_using_real_model=(xgb_model is not None),
+        forecast_weather_df=None,
+        st_lat=st_lat,
+        st_lon=st_lon,
+        hours=24,
+        static_weather=static_weather,
+        enable_feedback=False,
+        simulation_mode=True
+    )
+    
+    feedback = generate_autoregressive_forecast(
+        current_pm=req.pm25,
+        now_utc=now_utc,
+        is_using_real_model=(xgb_model is not None),
+        forecast_weather_df=None,
+        st_lat=st_lat,
+        st_lon=st_lon,
+        hours=24,
+        static_weather=static_weather,
+        enable_feedback=req.enable_feedback,
+        simulation_mode=True
+    )
+    
+    return SimulationResponse(
+        baseline_forecast=[f.predicted_pm25 for f in baseline],
+        feedback_forecast=[f.predicted_pm25 for f in feedback],
+        hour_offset=[f.hour_offset for f in baseline],
+        message="Illustrative scenario testing based on published aerosol-PBL feedback research — not live production data."
+    )
+
+
+@app.get("/forecast/{station_name}", response_model=ForecastResponse, summary="Get 72-Hour PM2.5 Forecast (XGBoost ML)")
+def get_forecast_for_station(station_name: str):
+    """
+    Generates a 72-hour forecast for the station using the trained XGBoost model,
+    real Open-Meteo hour-by-hour forecast weather, and official CPCB AQI.
+    """
+    decoded_name = urllib.parse.unquote(station_name).strip()
+    df_raw = load_raw_data()
+    coords_map = get_station_coordinates_map()
+
+    # Find station in current readings
+    matched = df_raw[df_raw["location"].str.strip().str.lower() == decoded_name.lower()]
+    if matched.empty:
+        matched = df_raw[df_raw["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
+
+    if not matched.empty:
+        actual_name = str(matched["location"].iloc[0])
+        city = str(matched["city"].iloc[0]) if "city" in matched.columns else "Delhi NCR"
+        pm25_row = matched[matched["parameter"].astype(str).str.lower() == "pm25"]
+        baseline_pm25 = float(pm25_row["value"].iloc[0]) if (not pm25_row.empty and pd.notna(pm25_row["value"].iloc[0])) else 50.0
+    else:
+        actual_name = decoded_name
+        city = "Delhi NCR"
+        baseline_pm25 = 50.0
+
+    coords = coords_map.get(actual_name, {"latitude": 28.6139, "longitude": 77.2090})
+    st_lat = coords.get("latitude", 28.6139)
+    st_lon = coords.get("longitude", 77.2090)
+
+    now_utc = datetime.now(timezone.utc)
+    forecast_list = []
+    is_using_real_model = (xgb_model is not None)
+    forecast_weather_df = load_forecast_weather()
+
+    current_pm = max(5.0, baseline_pm25)
+    current_aqi_num, current_aqi_cat = pm25_to_aqi(current_pm)
+
+    forecast_list = generate_autoregressive_forecast(
+        current_pm=current_pm,
+        now_utc=now_utc,
+        is_using_real_model=is_using_real_model,
+        forecast_weather_df=forecast_weather_df,
+        st_lat=st_lat,
+        st_lon=st_lon,
+        hours=72,
+        static_weather=None,
+        enable_feedback=False
+    )
 
     return ForecastResponse(
         station_name=actual_name,
