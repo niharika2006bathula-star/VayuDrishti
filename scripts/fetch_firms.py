@@ -115,15 +115,15 @@ def main():
     csv_chunks = []
     
     batch1 = fetch_firms_batch(map_key, days=5, start_date=prior_date)
-    if batch1 and len(batch1.splitlines()) > 1:
+    if batch1 is not None:
         csv_chunks.append(batch1)
 
     batch2 = fetch_firms_batch(map_key, days=5)
-    if batch2 and len(batch2.splitlines()) > 1:
+    if batch2 is not None:
         csv_chunks.append(batch2)
 
     if not csv_chunks:
-        print("Error: Could not retrieve fire detections from NASA FIRMS.")
+        print("Error: NASA FIRMS API failed to return any chunks. Aborting to protect existing data.")
         sys.exit(1)
 
     # Combine CSV data and deduplicate

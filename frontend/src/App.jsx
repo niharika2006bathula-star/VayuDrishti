@@ -604,6 +604,7 @@ function ModelScatterPlot({ data }) {
 export default function App() {
   const [stations, setStations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [dataStatus, setDataStatus] = useState(null);
   const [error, setError] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   
@@ -848,11 +849,30 @@ export default function App() {
     }
   };
 
+  const fetchDataStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/data-status`);
+      if (res.ok) {
+        const data = await res.json();
+        setDataStatus(data);
+      }
+    } catch (err) {
+      console.error("Error fetching data status:", err);
+    }
+  };
+
   useEffect(() => {
     fetchStations();
+    fetchDataStatus();
     fetchAlerts();
     fetchMovementForecast();
     fetchFires();
+  }, []);
+
+  // Auto-poll data-status every 60 seconds so the banner stays fresh
+  useEffect(() => {
+    const interval = setInterval(fetchDataStatus, 60000);
+    return () => clearInterval(interval);
   }, []);
 
   // Auto-advance movement time slider when playing
@@ -1220,6 +1240,16 @@ export default function App() {
 
   const maxTop5PM = top5Stations.length > 0 ? top5Stations[0].latest_pm25 : 100;
 
+  const predictedHotspots = useMemo(() => {
+    if (!movementData || !movementData.steps || !movementData.steps[selectedStepIdx]) return [];
+    return [...movementData.steps[selectedStepIdx].stations]
+      .sort((a, b) => b.pm25 - a.pm25)
+      .slice(0, 5);
+  }, [movementData, selectedStepIdx]);
+  
+  const maxPredictedPM = predictedHotspots.length > 0 ? predictedHotspots[0].pm25 : 100;
+  const predictedOffset = movementData?.steps?.[selectedStepIdx]?.offset_hours || 0;
+
   // Processed Stations for Table View (Sortable & Filterable)
   const allCities = useMemo(() => {
     const set = new Set(stations.map(s => s.city || 'Delhi NCR'));
@@ -1343,7 +1373,7 @@ export default function App() {
                 navTab === 'stations' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}>
               <MapPin className="w-4 h-4 shrink-0" />
-              <span className="hidden lg:inline">Stations (50)</span>
+              <span className="hidden lg:inline">Stations ({stations.length})</span>
               <span className="hidden lg:inline ml-auto text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300">
                 {stations.length}
               </span>
@@ -1429,7 +1459,7 @@ export default function App() {
           <div className="flex items-center gap-4">
             <h2 className="text-base font-bold text-white font-heading">
               {navTab === 'dashboard' && 'Delhi NCR Air Quality & Forecasting Intelligence'}
-              {navTab === 'stations' && 'Monitoring Stations Directory (50 Active Sensors)'}
+              {navTab === 'stations' && `Monitoring Stations Directory (${stations.length} Active Sensors)`}
               {navTab === 'alerts' && 'Automated Air Quality Rules & Active Alerts'}
 
               {navTab === 'simulator' && 'Scenario Simulator (What-If Forecasting)'}
@@ -1445,9 +1475,24 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            {dataStatus && (
+              <div className="hidden xl:flex items-center gap-3 mr-4 text-[10px] text-slate-400 font-medium">
+                <div className="flex items-center gap-1.5" title={`Status: ${dataStatus.openaq_status || 'PENDING'}${dataStatus.openaq_rows != null ? ' | ' + dataStatus.openaq_rows + ' rows' : ''}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full ${dataStatus.openaq_status === 'SUCCESS' ? 'bg-emerald-400' : dataStatus.openaq_status === 'FAILED' ? 'bg-amber-400 animate-pulse' : 'bg-slate-500'}`}></div>
+                  OpenAQ: {dataStatus.openaq_last_refresh ? new Date(dataStatus.openaq_last_refresh).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'N/A'}
+                  {dataStatus.openaq_rows != null && <span className="text-slate-500">({dataStatus.openaq_rows})</span>}
+                </div>
+                <div className="flex items-center gap-1.5" title={`Status: ${dataStatus.firms_status || 'PENDING'}${dataStatus.firms_rows != null ? ' | ' + dataStatus.firms_rows + ' rows' : ''}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full ${dataStatus.firms_status === 'SUCCESS' ? 'bg-emerald-400' : dataStatus.firms_status === 'FAILED' ? 'bg-amber-400 animate-pulse' : 'bg-slate-500'}`}></div>
+                  FIRMS: {dataStatus.firms_last_refresh ? new Date(dataStatus.firms_last_refresh).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'N/A'}
+                  {dataStatus.firms_rows != null && <span className="text-slate-500">({dataStatus.firms_rows})</span>}
+                </div>
+              </div>
+            )}
             <button 
               onClick={() => {
                 fetchStations();
+                fetchDataStatus();
                 if (navTab === 'alerts') fetchAlerts();
               }}
               disabled={loading}
@@ -1812,9 +1857,11 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Right-Side Panel: Top 5 Highest PM2.5 Stations */}
-                <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
-                  <div>
+                {/* Right-Side Panels: Live Top 5 & Predicted Hotspots */}
+                <div className="flex flex-col gap-6">
+                  {/* Live Top 5 */}
+                  <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
+                    <div>
                     <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
                       <div className="flex items-center gap-2">
                         <ShieldAlert className="w-4 h-4 text-rose-400" />
@@ -1886,6 +1933,80 @@ export default function App() {
                       Open Intelligence Modal &rarr;
                     </span>
                   </div>
+                </div>
+                  
+                {/* Predicted Hotspots */}
+                  {predictedOffset > 0 && predictedHotspots.length > 0 && (
+                    <div className="bg-[#0F172A] border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
+                          <div className="flex items-center gap-2">
+                            <Activity className="w-4 h-4 text-orange-400" />
+                            <h3 className="font-bold text-sm text-white font-heading">
+                              Predicted Hotspots (+{predictedOffset}h)
+                            </h3>
+                          </div>
+                          <span className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">Forecast Ranking</span>
+                        </div>
+
+                        <div className="space-y-3">
+                          {predictedHotspots.map((st, idx) => {
+                            const stName = st.station_name || st.name || 'Unknown Station';
+                            const isSelected = selectedStation?.name === stName;
+                            const theme = getPM25Theme(st.pm25);
+                            const barWidth = Math.max(15, Math.round((st.pm25 / maxPredictedPM) * 100));
+
+                            return (
+                              <div 
+                                key={stName} 
+                                onClick={() => {
+                                  const fullSt = stations.find(s => s.name === stName);
+                                  if (fullSt) {
+                                    setSelectedStation(fullSt);
+                                    if (mapInstanceRef.current && fullSt.latitude && fullSt.longitude) {
+                                      mapInstanceRef.current.flyTo([fullSt.latitude, fullSt.longitude], 11, { duration: 0.8 });
+                                    }
+                                  }
+                                }}
+                                className={`p-2.5 rounded-xl transition-all cursor-pointer group ${
+                                  isSelected 
+                                    ? 'bg-orange-950/40 border-2 border-orange-500 shadow-lg shadow-orange-500/10' 
+                                    : 'bg-slate-950/70 border border-slate-800/80 hover:border-slate-700'
+                                }`}>
+                                
+                                <div className="flex items-center justify-between text-xs mb-1.5">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <span className={`w-4 h-4 rounded-full text-[10px] font-bold flex items-center justify-center shrink-0 ${
+                                      isSelected ? 'bg-orange-500 text-slate-950' : 'bg-slate-800 text-slate-300'
+                                    }`}>
+                                      {idx + 1}
+                                    </span>
+                                    <span className={`font-semibold truncate transition-colors ${
+                                      isSelected ? 'text-orange-300' : 'text-slate-200 group-hover:text-orange-400'
+                                    }`}>
+                                      {stName.split(',')[0]}
+                                    </span>
+                                  </div>
+                                  <span className={`font-bold text-xs ${theme.text}`}>
+                                    {Math.round(st.pm25)} µg/m³
+                                  </span>
+                                </div>
+
+                                <div className="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden">
+                                  <div 
+                                    style={{ width: `${barWidth}%` }}
+                                    className={`h-full rounded-full transition-all duration-500 ${
+                                      st.pm25 > 100 ? 'bg-gradient-to-r from-orange-500 to-rose-500' : 'bg-gradient-to-r from-amber-400 to-orange-400'
+                                    }`}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </section>
             </>
@@ -2090,7 +2211,7 @@ export default function App() {
                       </h3>
                     </div>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Evaluated continuously across all 50 Delhi NCR stations using live telemetry and XGBoost forecasts
+                      Evaluated continuously across all {stations.length} active Delhi NCR stations using live telemetry and XGBoost forecasts
                     </p>
                   </div>
 
@@ -2200,7 +2321,7 @@ export default function App() {
                     <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto mb-3 opacity-90" />
                     <h5 className="text-base font-bold text-white mb-1">No Active Alerts Right Now</h5>
                     <p className="text-xs text-slate-400 max-w-md mx-auto">
-                      All 50 Delhi NCR monitoring stations are operating within safe baseline thresholds with active atmospheric dispersion.
+                      All active Delhi NCR monitoring stations are operating within safe baseline thresholds with active atmospheric dispersion.
                     </p>
                   </div>
                 )}
@@ -2652,7 +2773,7 @@ export default function App() {
                   <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
                     <div className="font-bold text-white mb-0.5">OpenAQ Community API (v3)</div>
                     <p className="text-slate-400 text-[11px]">
-                      Provides 15-minute sub-hourly ground monitoring station telemetry across 50 locations in Delhi NCR.
+                      Provides 15-minute sub-hourly ground monitoring station telemetry across {stations.length} active locations in Delhi NCR.
                     </p>
                   </div>
 

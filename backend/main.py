@@ -21,6 +21,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import urllib.parse
+import asyncio
+import subprocess
+import os
 
 import joblib
 import numpy as np
@@ -109,6 +112,156 @@ if MODEL_PATH.exists():
         print("[Backend] Successfully initialized and cached SHAP TreeExplainer")
     except Exception as e:
         print(f"[Backend Warning] Could not initialize model or TreeExplainer: {e}")
+
+# -----------------------------------------------------------------------------
+# Background Tasks — Safe Periodic Data Refresh (20-minute interval)
+# -----------------------------------------------------------------------------
+FIRMS_CSV_PATH = BASE_DIR / "data" / "raw" / "firms_processed.csv"
+REFRESH_INTERVAL_SECONDS = 20 * 60  # 20 minutes
+
+# Global refresh state — read by /data-status endpoint
+refresh_state = {
+    "openaq": {
+        "last_refresh": None,   # ISO timestamp of last successful refresh
+        "rows": None,           # Row count after last successful refresh
+        "status": "PENDING",    # PENDING | SUCCESS | FAILED
+        "last_error": None,     # Error message if last attempt failed
+    },
+    "firms": {
+        "last_refresh": None,
+        "rows": None,
+        "status": "PENDING",
+        "last_error": None,
+    },
+}
+
+
+def _count_csv_rows(path: Path) -> int:
+    """Safely count rows in a CSV file (excluding header). Returns 0 on error."""
+    try:
+        if path.exists():
+            df = pd.read_csv(path)
+            return len(df)
+    except Exception:
+        pass
+    return 0
+
+
+async def periodic_refresh():
+    """Background coroutine: refreshes OpenAQ and FIRMS data every 20 minutes.
+    
+    Safety guarantees:
+      - OpenAQ: fetch_openaq.py aborts (exit 1) if fewer than 10 valid rows,
+        preserving existing data.
+      - FIRMS: fetch_firms.py aborts (exit 1) only on HTTP/parse failure.
+        Zero fires is a legitimate outcome and is NOT treated as a failure.
+      - All exceptions are caught — a failed refresh never crashes the API.
+    """
+    # Initial delay: let the API finish starting up before first refresh
+    await asyncio.sleep(10)
+
+    while True:
+        now_ts = datetime.now().isoformat(timespec="seconds")
+        print(f"\n{'='*72}")
+        print(f"[{now_ts}] [Refresh] Starting periodic data refresh cycle...")
+        print(f"{'='*72}")
+
+        # --- OpenAQ Refresh ---
+        rows_before = _count_csv_rows(RAW_CSV_PATH)
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] OpenAQ — rows before: {rows_before}")
+        try:
+            openaq_res = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, str(BASE_DIR / "scripts" / "fetch_openaq.py")],
+                capture_output=True,
+                text=True,
+                cwd=str(BASE_DIR),
+                timeout=120
+            )
+            rows_after = _count_csv_rows(RAW_CSV_PATH)
+            if openaq_res.returncode == 0:
+                refresh_state["openaq"]["last_refresh"] = datetime.now().isoformat(timespec="seconds")
+                refresh_state["openaq"]["rows"] = rows_after
+                refresh_state["openaq"]["status"] = "SUCCESS"
+                refresh_state["openaq"]["last_error"] = None
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] OpenAQ — SUCCESS — {rows_after} rows (was {rows_before})")
+            else:
+                refresh_state["openaq"]["status"] = "FAILED"
+                refresh_state["openaq"]["last_error"] = f"Exit code {openaq_res.returncode}"
+                # Preserve existing row count since data wasn't overwritten
+                refresh_state["openaq"]["rows"] = rows_after
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] OpenAQ — FAILED (exit {openaq_res.returncode}) — existing data preserved ({rows_after} rows)")
+                if openaq_res.stdout.strip():
+                    print(f"  stdout: {openaq_res.stdout.strip()[-500:]}")
+                if openaq_res.stderr.strip():
+                    print(f"  stderr: {openaq_res.stderr.strip()[-500:]}")
+        except subprocess.TimeoutExpired:
+            refresh_state["openaq"]["status"] = "FAILED"
+            refresh_state["openaq"]["last_error"] = "Timeout (120s)"
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] OpenAQ — FAILED (timeout 120s) — existing data preserved")
+        except Exception as e:
+            refresh_state["openaq"]["status"] = "FAILED"
+            refresh_state["openaq"]["last_error"] = str(e)
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] OpenAQ — EXCEPTION: {e}")
+
+        # --- FIRMS Refresh ---
+        rows_before = _count_csv_rows(FIRMS_CSV_PATH)
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — rows before: {rows_before}")
+        try:
+            firms_res = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, str(BASE_DIR / "scripts" / "fetch_firms.py")],
+                capture_output=True,
+                text=True,
+                cwd=str(BASE_DIR),
+                timeout=120
+            )
+            rows_after = _count_csv_rows(FIRMS_CSV_PATH)
+            if firms_res.returncode == 0:
+                refresh_state["firms"]["last_refresh"] = datetime.now().isoformat(timespec="seconds")
+                refresh_state["firms"]["rows"] = rows_after
+                refresh_state["firms"]["status"] = "SUCCESS"
+                refresh_state["firms"]["last_error"] = None
+                # Note: rows_after == 0 is legitimate (off-season, no fires detected)
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — SUCCESS — {rows_after} rows (was {rows_before}){' [zero fires is valid off-season]' if rows_after == 0 else ''}")
+            else:
+                refresh_state["firms"]["status"] = "FAILED"
+                refresh_state["firms"]["last_error"] = f"Exit code {firms_res.returncode}"
+                refresh_state["firms"]["rows"] = rows_after
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — FAILED (exit {firms_res.returncode}) — existing data preserved ({rows_after} rows)")
+                if firms_res.stdout.strip():
+                    print(f"  stdout: {firms_res.stdout.strip()[-500:]}")
+                if firms_res.stderr.strip():
+                    print(f"  stderr: {firms_res.stderr.strip()[-500:]}")
+        except subprocess.TimeoutExpired:
+            refresh_state["firms"]["status"] = "FAILED"
+            refresh_state["firms"]["last_error"] = "Timeout (120s)"
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — FAILED (timeout 120s) — existing data preserved")
+        except Exception as e:
+            refresh_state["firms"]["status"] = "FAILED"
+            refresh_state["firms"]["last_error"] = str(e)
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — EXCEPTION: {e}")
+
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Cycle complete. Next refresh in {REFRESH_INTERVAL_SECONDS // 60} minutes.")
+        print(f"{'='*72}\n")
+
+        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Seed refresh_state with current file info so /data-status works immediately
+    for label, path in [("openaq", RAW_CSV_PATH), ("firms", FIRMS_CSV_PATH)]:
+        if path.exists():
+            refresh_state[label]["rows"] = _count_csv_rows(path)
+            refresh_state[label]["last_refresh"] = datetime.fromtimestamp(
+                os.path.getmtime(path)
+            ).isoformat(timespec="seconds")
+            refresh_state[label]["status"] = "SUCCESS"
+    asyncio.create_task(periodic_refresh())
+    print(f"[Backend] Background periodic refresh task scheduled ({REFRESH_INTERVAL_SECONDS // 60}m interval).")
+    print(f"[Backend] Initial data: OpenAQ={refresh_state['openaq']['rows']} rows, FIRMS={refresh_state['firms']['rows']} rows")
+
 
 
 def get_station_coordinates_map() -> Dict[str, Dict[str, float]]:
@@ -533,6 +686,19 @@ def health_check():
         "ml_model_loaded": xgb_model is not None,
         "shap_explainer_loaded": shap_explainer is not None,
         "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/data-status")
+def get_data_status():
+    """Returns last-refresh timestamps, row counts, and status for each dataset."""
+    return {
+        "openaq_last_refresh": refresh_state["openaq"]["last_refresh"],
+        "openaq_rows": refresh_state["openaq"]["rows"],
+        "openaq_status": refresh_state["openaq"]["status"],
+        "firms_last_refresh": refresh_state["firms"]["last_refresh"],
+        "firms_rows": refresh_state["firms"]["rows"],
+        "firms_status": refresh_state["firms"]["status"],
     }
 
 

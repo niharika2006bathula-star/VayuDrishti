@@ -196,10 +196,13 @@ def main():
     if stale_count > 0:
         print(f"\n[Warning] {stale_count} records are from inactive/stale monitoring stations (>30 days old).")
 
-    # Filter out stale records for the primary clean dataset, or sort by latest
     # We will keep active records in CSV and sort by most recent timestamp
     df_clean = df[~stale_mask].drop(columns=["dt_parsed"]).reset_index(drop=True)
     
+    if len(df_clean) < 10:
+        print("\n[Warning] Fetch returned too few valid rows — aborting to protect existing data.")
+        sys.exit(1)
+        
     # Save CSV
     df_clean.to_csv(CSV_OUT, index=False)
     print(f"Active cleaned data saved ({len(df_clean)} rows) -> {CSV_OUT}")
