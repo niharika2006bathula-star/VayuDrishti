@@ -1513,6 +1513,11 @@ export default function App() {
                   FIRMS: {dataStatus.firms_last_refresh ? new Date(dataStatus.firms_last_refresh).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'N/A'}
                   {dataStatus.firms_rows != null && <span className="text-slate-500">({dataStatus.firms_rows})</span>}
                 </div>
+                <div className="flex items-center gap-1.5" title={`Status: ${dataStatus.weather_status || 'PENDING'}${dataStatus.weather_rows != null ? ' | ' + dataStatus.weather_rows + ' rows' : ''}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full ${dataStatus.weather_status === 'SUCCESS' ? 'bg-emerald-400' : dataStatus.weather_status === 'FAILED' ? 'bg-amber-400 animate-pulse' : 'bg-slate-500'}`}></div>
+                  Weather: {dataStatus.weather_last_refresh ? new Date(dataStatus.weather_last_refresh).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'N/A'}
+                  {dataStatus.weather_rows != null && <span className="text-slate-500">({dataStatus.weather_rows}h)</span>}
+                </div>
               </div>
             )}
             <button 

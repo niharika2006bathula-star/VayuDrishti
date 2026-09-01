@@ -178,6 +178,12 @@ refresh_state = {
         "status": "PENDING",
         "last_error": None,
     },
+    "weather": {
+        "last_refresh": None,
+        "rows": None,
+        "status": "PENDING",
+        "last_error": None,
+    },
 }
 
 
@@ -193,13 +199,15 @@ def _count_csv_rows(path: Path) -> int:
 
 
 async def periodic_refresh():
-    """Background coroutine: refreshes OpenAQ and FIRMS data every 20 minutes.
+    """Background coroutine: refreshes OpenAQ, FIRMS, and Open-Meteo weather data every 20 minutes.
     
     Safety guarantees:
       - OpenAQ: fetch_openaq.py aborts (exit 1) if fewer than 10 valid rows,
         preserving existing data.
       - FIRMS: fetch_firms.py aborts (exit 1) only on HTTP/parse failure.
         Zero fires is a legitimate outcome and is NOT treated as a failure.
+      - Weather: fetch_openmeteo_forecast.py aborts (exit 1) if fewer than 24 rows
+        or invalid schema, preserving existing data.
       - All exceptions are caught — a failed refresh never crashes the API.
     """
     # Initial delay: let the API finish starting up before first refresh
@@ -287,6 +295,43 @@ async def periodic_refresh():
             refresh_state["firms"]["last_error"] = str(e)
             print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] FIRMS  — EXCEPTION: {e}")
 
+        # --- Open-Meteo Weather Refresh ---
+        rows_before = _count_csv_rows(FORECAST_WEATHER_CSV_PATH)
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Weather — rows before: {rows_before}")
+        try:
+            weather_res = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, str(BASE_DIR / "scripts" / "fetch_openmeteo_forecast.py")],
+                capture_output=True,
+                text=True,
+                cwd=str(BASE_DIR),
+                timeout=60
+            )
+            rows_after = _count_csv_rows(FORECAST_WEATHER_CSV_PATH)
+            if weather_res.returncode == 0 and rows_after >= 24:
+                refresh_state["weather"]["last_refresh"] = datetime.now().isoformat(timespec="seconds")
+                refresh_state["weather"]["rows"] = rows_after
+                refresh_state["weather"]["status"] = "SUCCESS"
+                refresh_state["weather"]["last_error"] = None
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Weather — SUCCESS — {rows_after} rows (was {rows_before})")
+            else:
+                refresh_state["weather"]["status"] = "FAILED"
+                refresh_state["weather"]["last_error"] = f"Exit code {weather_res.returncode}"
+                refresh_state["weather"]["rows"] = rows_after
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Weather — FAILED (exit {weather_res.returncode}) — existing data preserved ({rows_after} rows)")
+                if weather_res.stdout.strip():
+                    print(f"  stdout: {weather_res.stdout.strip()[-500:]}")
+                if weather_res.stderr.strip():
+                    print(f"  stderr: {weather_res.stderr.strip()[-500:]}")
+        except subprocess.TimeoutExpired:
+            refresh_state["weather"]["status"] = "FAILED"
+            refresh_state["weather"]["last_error"] = "Timeout (60s)"
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Weather — FAILED (timeout 60s) — existing data preserved")
+        except Exception as e:
+            refresh_state["weather"]["status"] = "FAILED"
+            refresh_state["weather"]["last_error"] = str(e)
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Weather — EXCEPTION: {e}")
+
         print(f"[{datetime.now().isoformat(timespec='seconds')}] [Refresh] Cycle complete. Next refresh in {REFRESH_INTERVAL_SECONDS // 60} minutes.")
         print(f"{'='*72}\n")
 
@@ -296,7 +341,7 @@ async def periodic_refresh():
 @app.on_event("startup")
 async def startup_event():
     # Seed refresh_state with current file info so /data-status works immediately
-    for label, path in [("openaq", RAW_CSV_PATH), ("firms", FIRMS_CSV_PATH)]:
+    for label, path in [("openaq", RAW_CSV_PATH), ("firms", FIRMS_CSV_PATH), ("weather", FORECAST_WEATHER_CSV_PATH)]:
         if path.exists():
             refresh_state[label]["rows"] = _count_csv_rows(path)
             refresh_state[label]["last_refresh"] = datetime.fromtimestamp(
@@ -305,7 +350,8 @@ async def startup_event():
             refresh_state[label]["status"] = "SUCCESS"
     asyncio.create_task(periodic_refresh())
     print(f"[Backend] Background periodic refresh task scheduled ({REFRESH_INTERVAL_SECONDS // 60}m interval).")
-    print(f"[Backend] Initial data: OpenAQ={refresh_state['openaq']['rows']} rows, FIRMS={refresh_state['firms']['rows']} rows")
+    print(f"[Backend] Initial data: OpenAQ={refresh_state['openaq']['rows']} rows, FIRMS={refresh_state['firms']['rows']} rows, Weather={refresh_state['weather']['rows']} rows")
+
 
 
 
@@ -481,6 +527,20 @@ def extract_station_current_features(station_name: str) -> tuple[str, str, float
     df_w = load_forecast_weather()
     if df_w is not None and len(df_w) > 0:
         w_row = df_w.iloc[0]
+        if "timestamp" in df_w.columns:
+            try:
+                # Align with current UTC hour or closest forecast hour
+                df_w_dt = pd.to_datetime(df_w["timestamp"])
+                cur_dt = now_utc.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+                matched = df_w[df_w_dt == cur_dt]
+                if not matched.empty:
+                    w_row = matched.iloc[0]
+                else:
+                    diffs = (df_w_dt - cur_dt).abs()
+                    w_row = df_w.iloc[diffs.argmin()]
+            except Exception:
+                w_row = df_w.iloc[0]
+
         temp = float(w_row.get("temperature_2m", 28.0))
         humidity = float(w_row.get("relative_humidity_2m", 65.0))
         wind_spd = float(w_row.get("wind_speed_10m", 8.0))
@@ -817,6 +877,9 @@ def get_data_status():
         "firms_last_refresh": refresh_state["firms"]["last_refresh"],
         "firms_rows": refresh_state["firms"]["rows"],
         "firms_status": refresh_state["firms"]["status"],
+        "weather_last_refresh": refresh_state["weather"]["last_refresh"],
+        "weather_rows": refresh_state["weather"]["rows"],
+        "weather_status": refresh_state["weather"]["status"],
     }
 
 

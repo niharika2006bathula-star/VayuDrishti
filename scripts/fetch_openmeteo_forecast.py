@@ -100,19 +100,42 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Fetch
-    data = fetch_forecast_data()
+    try:
+        data = fetch_forecast_data()
+    except Exception as e:
+        print(f"[Error] Failed to fetch Open-Meteo forecast: {e}")
+        sys.exit(1)
 
-    # 2. Save raw JSON
+    # 2. Validate & Build DataFrame
+    try:
+        df = build_dataframe(data)
+    except Exception as e:
+        print(f"[Error] Failed to parse forecast dataframe: {e}")
+        sys.exit(1)
+
+    # Safety check: ensure at least 24 hours of forecast and required columns
+    required_cols = ["timestamp", "temperature_2m", "relative_humidity_2m", "wind_speed_10m"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if len(df) < 24 or missing_cols:
+        print(f"[Safety Abort] Incomplete weather forecast data (rows={len(df)}, missing={missing_cols}). Existing file preserved.")
+        sys.exit(1)
+
+    # 3. Save raw JSON
     with open(JSON_OUT, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     print(f"Raw JSON saved  -> {JSON_OUT}")
 
-    # 3. Build & save CSV
-    df = build_dataframe(data)
-    df.to_csv(CSV_OUT, index=False)
-    print(f"Clean CSV saved -> {CSV_OUT}")
+    # 4. Save clean CSV atomically
+    tmp_csv = OUTPUT_DIR / "openmeteo_forecast_delhi.tmp.csv"
+    df.to_csv(tmp_csv, index=False)
+    if tmp_csv.exists() and tmp_csv.stat().st_size > 0:
+        tmp_csv.replace(CSV_OUT)
+        print(f"Clean CSV saved -> {CSV_OUT}")
+    else:
+        print("[Error] Failed to write temporary weather CSV. Existing data preserved.")
+        sys.exit(1)
 
-    # 4. Summary Output
+    # 5. Summary Output
     print(f"\nDate range covered : {df['timestamp'].min()} -> {df['timestamp'].max()}")
     print(f"Total hourly rows  : {len(df):,}")
     print(f"Columns            : {list(df.columns)}\n")
@@ -122,3 +145,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
