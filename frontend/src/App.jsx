@@ -19,6 +19,7 @@ import {
   ArrowDownRight,
   Flame,
   Thermometer,
+  HeartPulse,
   CloudRain,
   Gauge,
   LayoutDashboard,
@@ -602,6 +603,341 @@ function ModelScatterPlot({ data }) {
     </div>
   );
 }
+
+// Interactive Temperature vs PM2.5 Historical Correlation Component
+function StationCorrelationChart({ correlationData, stationName }) {
+  if (!correlationData || !correlationData.scatter_points || correlationData.scatter_points.length === 0) {
+    return (
+      <div className="p-8 text-center text-xs text-slate-500">
+        <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-cyan-500" />
+        Loading historical correlation metrics...
+      </div>
+    );
+  }
+
+  const { pearson_r, sample_size, interpretation, temp_min, temp_max, pm25_min, pm25_max, scatter_points } = correlationData;
+  
+  // SVG dimensions
+  const width = 640;
+  const height = 280;
+  const padLeft = 50;
+  const padRight = 25;
+  const padTop = 25;
+  const padBottom = 45;
+  const innerW = width - padLeft - padRight;
+  const innerH = height - padTop - padBottom;
+
+  const minX = Math.floor(temp_min - 2);
+  const maxX = Math.ceil(temp_max + 2);
+  const minY = 0;
+  const maxY = Math.ceil(pm25_max * 1.08 / 50) * 50;
+
+  const getX = (t) => padLeft + ((t - minX) / (maxX - minX)) * innerW;
+  const getY = (p) => padTop + innerH - ((p - minY) / (maxY - minY)) * innerH;
+
+  // Linear Regression Line (y = mx + b)
+  const n = scatter_points.length;
+  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+  for (let i = 0; i < n; i++) {
+    const pt = scatter_points[i];
+    sumX += pt.temp;
+    sumY += pt.pm25;
+    sumXY += pt.temp * pt.pm25;
+    sumX2 += pt.temp * pt.temp;
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+  const den = sumX2 - n * meanX * meanX;
+  const slope = den !== 0 ? (sumXY - n * meanX * meanY) / den : 0;
+  const intercept = meanY - slope * meanX;
+
+  const lineX1 = minX + 1;
+  const lineY1 = Math.max(0, slope * lineX1 + intercept);
+  const lineX2 = maxX - 1;
+  const lineY2 = Math.max(0, slope * lineX2 + intercept);
+
+  // Correlation strength & theme
+  const isNegative = pearson_r < -0.1;
+  const isPositive = pearson_r > 0.1;
+  const rColor = isNegative ? 'text-emerald-400' : isPositive ? 'text-rose-400' : 'text-cyan-400';
+  const rBg = isNegative ? 'bg-emerald-950/60 border-emerald-500/40' : isPositive ? 'bg-rose-950/60 border-rose-500/40' : 'bg-cyan-950/60 border-cyan-500/40';
+
+  return (
+    <div className="space-y-4">
+      {/* Metric Cards Banner */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className={`p-3 rounded-xl border ${rBg} flex flex-col justify-between`}>
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Pearson Correlation (r)</div>
+          <div className={`text-xl font-bold font-mono mt-1 ${rColor}`}>
+            {pearson_r > 0 ? `+${pearson_r.toFixed(4)}` : pearson_r.toFixed(4)}
+          </div>
+          <div className="text-[10px] text-slate-400 mt-0.5">Linear coefficient</div>
+        </div>
+
+        <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Historical Samples</div>
+          <div className="text-xl font-bold font-mono text-white mt-1">
+            n = {sample_size.toLocaleString()}
+          </div>
+          <div className="text-[10px] text-slate-400 mt-0.5">Observed hourly rows</div>
+        </div>
+
+        <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Observed Temp</div>
+          <div className="text-base font-bold font-mono text-rose-300 mt-1">
+            {temp_min}°C – {temp_max}°C
+          </div>
+          <div className="text-[10px] text-slate-400 mt-0.5">Ambient thermal range</div>
+        </div>
+
+        <div className="p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col justify-between">
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">Observed PM2.5</div>
+          <div className="text-base font-bold font-mono text-cyan-300 mt-1">
+            {pm25_min} – {pm25_max} <span className="text-[10px] font-sans text-slate-400">µg/m³</span>
+          </div>
+          <div className="text-[10px] text-slate-400 mt-0.5">Pollution range</div>
+        </div>
+      </div>
+
+      {/* Honest Plain-Language Interpretation Box */}
+      <div className="p-3.5 bg-slate-900/90 border-l-4 border-cyan-500 rounded-r-xl text-xs">
+        <div className="font-bold text-slate-100 mb-1 flex items-center gap-1.5">
+          <Info className="w-3.5 h-3.5 text-cyan-400" />
+          <span>Empirical Interpretation</span>
+        </div>
+        <p className="text-slate-300 leading-relaxed">
+          {interpretation}
+        </p>
+      </div>
+
+      {/* Scatter Plot SVG */}
+      <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4">
+        <div className="flex items-center justify-between text-xs text-slate-300 font-semibold mb-2">
+          <span>Historical Scatter & Trendline (Hourly Resolution)</span>
+          <span className="text-[10px] text-slate-400 font-normal">
+            Regression: y = {slope.toFixed(2)}x {intercept >= 0 ? `+ ${intercept.toFixed(1)}` : `- ${Math.abs(intercept).toFixed(1)}`}
+          </span>
+        </div>
+
+        <div className="relative w-full overflow-hidden">
+          <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
+            {/* Grid lines */}
+            {[0, 100, 200, 300, 400].filter(v => v <= maxY).map((val) => (
+              <g key={`y-${val}`}>
+                <line
+                  x1={padLeft}
+                  y1={getY(val)}
+                  x2={width - padRight}
+                  y2={getY(val)}
+                  stroke="#1e293b"
+                  strokeDasharray="3 3"
+                  strokeWidth="0.5"
+                />
+                <text x={padLeft - 6} y={getY(val) + 3} fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">
+                  {val}
+                </text>
+              </g>
+            ))}
+
+            {/* X-axis tick marks */}
+            {[20, 25, 30, 35, 40, 45].filter(t => t >= minX && t <= maxX).map((val) => (
+              <g key={`x-${val}`}>
+                <line
+                  x1={getX(val)}
+                  y1={padTop + innerH}
+                  x2={getX(val)}
+                  y2={padTop + innerH + 4}
+                  stroke="#475569"
+                  strokeWidth="0.5"
+                />
+                <text x={getX(val)} y={padTop + innerH + 15} fill="#64748b" fontSize="10" textAnchor="middle" fontFamily="monospace">
+                  {val}°C
+                </text>
+              </g>
+            ))}
+
+            {/* Axes */}
+            <line x1={padLeft} y1={padTop + innerH} x2={width - padRight} y2={padTop + innerH} stroke="#475569" strokeWidth="1" />
+            <line x1={padLeft} y1={padTop} x2={padLeft} y2={padTop + innerH} stroke="#475569" strokeWidth="1" />
+
+            {/* Axis labels */}
+            <text x={padLeft + innerW / 2} y={height - 8} fill="#94a3b8" fontSize="11" textAnchor="middle" fontWeight="600">
+              Ambient Temperature (°C)
+            </text>
+            <text
+              x={14}
+              y={padTop + innerH / 2}
+              fill="#94a3b8"
+              fontSize="11"
+              textAnchor="middle"
+              transform={`rotate(-90 14,${padTop + innerH / 2})`}
+              fontWeight="600"
+            >
+              PM2.5 (µg/m³)
+            </text>
+
+            {/* Scatter points */}
+            {scatter_points.map((pt, i) => (
+              <circle
+                key={i}
+                cx={getX(pt.temp)}
+                cy={getY(pt.pm25)}
+                r={1.8}
+                fill={pt.pm25 > 200 ? "#f43f5e" : "#38bdf8"}
+                opacity={0.45}
+              />
+            ))}
+
+            {/* Linear Regression Trendline */}
+            <line
+              x1={getX(lineX1)}
+              y1={getY(lineY1)}
+              x2={getX(lineX2)}
+              y2={getY(lineY2)}
+              stroke="#fbbf24"
+              strokeWidth="2"
+              strokeDasharray="4 2"
+            />
+          </svg>
+        </div>
+
+        {/* Legend */}
+        <div className="mt-3 flex items-center justify-center gap-6 text-[11px] text-slate-400">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#38bdf8] opacity-70"></span>
+            <span>Historical Points (PM2.5 &le; 200)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#f43f5e] opacity-80"></span>
+            <span>Spikes (PM2.5 &gt; 200)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-4 border-t-2 border-dashed border-amber-400"></span>
+            <span className="text-amber-300 font-medium">Linear Fit (r = {pearson_r.toFixed(3)})</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Mandatory Caption & Seasonal Context Note */}
+      <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-1.5 text-center">
+        <div className="text-[11px] text-slate-300 italic">
+          &ldquo;Correlation, not causation — reflects patterns in this station's own historical data over the observed period.&rdquo;
+        </div>
+        <p className="text-[10px] text-slate-500 leading-relaxed max-w-xl mx-auto not-italic">
+          This analysis reflects our May–August (summer/monsoon) dataset. Delhi's well-documented winter pollution dynamics (cold, stagnant air trapping pollution, worsened by crop-burning season) are different and not captured here — a positive temperature-PM2.5 correlation in summer data doesn't contradict winter patterns, since these are different seasonal regimes with different dominant mechanisms.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// Citizen-Facing Health Advisory Component
+function StationHealthAdvisory({ advisoryData }) {
+  if (!advisoryData) {
+    return (
+      <div className="p-8 text-center text-xs text-slate-500">
+        <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-cyan-500" />
+        Loading public health guidance...
+      </div>
+    );
+  }
+
+  const { station_name, current_pm25, current_aqi, aqi_category, general_guidance, sensitive_groups_guidance, actionable_precautions, disclaimer } = advisoryData;
+
+  const getTierBadge = (cat) => {
+    switch (cat) {
+      case 'Good':
+        return 'bg-emerald-950/80 text-emerald-300 border-emerald-500/40';
+      case 'Satisfactory':
+        return 'bg-lime-950/80 text-lime-300 border-lime-500/40';
+      case 'Moderate':
+        return 'bg-amber-950/80 text-amber-300 border-amber-500/40';
+      case 'Poor':
+        return 'bg-orange-950/80 text-orange-300 border-orange-500/40';
+      case 'Very Poor':
+        return 'bg-rose-950/80 text-rose-300 border-rose-500/40';
+      case 'Severe':
+        return 'bg-purple-950/80 text-purple-300 border-purple-500/40';
+      default:
+        return 'bg-slate-900 text-slate-300 border-slate-700';
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Category Header Banner */}
+      <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1">
+            Current Air Quality Category
+          </div>
+          <div className="flex items-center gap-2.5">
+            <span className={`text-sm font-extrabold px-3 py-1 rounded-full border ${getTierBadge(aqi_category)}`}>
+              {aqi_category}
+            </span>
+            <span className="text-xs text-slate-300 font-medium">
+              AQI: <strong className="text-white font-mono">{current_aqi}</strong> (PM2.5: <span className="font-mono text-cyan-300">{current_pm25} µg/m³</span>)
+            </span>
+          </div>
+        </div>
+        <div className="text-xs text-slate-400 sm:text-right">
+          <div className="text-[10px] text-slate-500">Target Station</div>
+          <div className="font-semibold text-slate-200 truncate max-w-xs">{station_name}</div>
+        </div>
+      </div>
+
+      {/* Card 1: General Public Guidance */}
+      <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 space-y-1.5">
+        <div className="flex items-center gap-2 text-xs font-bold text-slate-200">
+          <Activity className="w-4 h-4 text-cyan-400" />
+          <span>General Public Guidance</span>
+        </div>
+        <p className="text-xs text-slate-300 leading-relaxed pl-6">
+          {general_guidance}
+        </p>
+      </div>
+
+      {/* Card 2: For Sensitive Groups */}
+      <div className="p-4 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-1.5">
+        <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+          <ShieldAlert className="w-4 h-4 text-amber-400" />
+          <span>For Sensitive Groups (Elderly, Children, Pregnant Individuals, Heart/Lung Conditions)</span>
+        </div>
+        <p className="text-xs text-slate-300 leading-relaxed pl-6">
+          {sensitive_groups_guidance}
+        </p>
+      </div>
+
+      {/* Card 3: Actionable Health Precautions */}
+      {actionable_precautions && actionable_precautions.length > 0 && (
+        <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2">
+          <div className="text-xs font-bold text-slate-200 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <span>Recommended Protective Actions</span>
+          </div>
+          <ul className="space-y-1.5 pl-6 text-xs text-slate-300 list-disc">
+            {actionable_precautions.map((action, idx) => (
+              <li key={idx} className="leading-snug">
+                {action}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Mandatory Disclaimer Box */}
+      <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800 text-[11px] text-slate-400 leading-relaxed">
+        <div className="flex items-start gap-2">
+          <Info className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
+          <span>
+            <strong className="text-slate-300 font-semibold">Medical Disclaimer:</strong> {disclaimer}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [stations, setStations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -728,11 +1064,13 @@ export default function App() {
   const [stationReadings, setStationReadings] = useState(null);
   const [forecastData, setForecastData] = useState(null);
   const [explainData, setExplainData] = useState(null);
+  const [correlationData, setCorrelationData] = useState(null);
+  const [healthAdvisory, setHealthAdvisory] = useState(null);
   const [dispersionData, setDispersionData] = useState(null);
   const [historyData, setHistoryData] = useState([]);
   const [historyDays, setHistoryDays] = useState(7);
   const [loadingModal, setLoadingModal] = useState(false);
-  const [activeTab, setActiveTab] = useState('current'); // 'current' | 'forecast' | 'explain'
+  const [activeTab, setActiveTab] = useState('current'); // 'current' | 'forecast' | 'explain' | 'correlation' | 'health' | 'sources'
 
   // Filter stations matching map search query
   const searchMatches = useMemo(() => {
@@ -1236,19 +1574,25 @@ export default function App() {
     setStationReadings(null);
     setForecastData(null);
     setExplainData(null);
+    setCorrelationData(null);
+    setHealthAdvisory(null);
     setNearbySources(null);
     setActiveTab('current');
 
     try {
-      const [currRes, fcRes, expRes] = await Promise.all([
+      const [currRes, fcRes, expRes, corrRes, healthRes] = await Promise.all([
         fetch(`${API_BASE}/current/${encodeURIComponent(station.name)}`),
         fetch(`${API_BASE}/forecast/${encodeURIComponent(station.name)}`),
-        fetch(`${API_BASE}/explain/${encodeURIComponent(station.name)}`)
+        fetch(`${API_BASE}/explain/${encodeURIComponent(station.name)}`),
+        fetch(`${API_BASE}/correlation/${encodeURIComponent(station.name)}`),
+        fetch(`${API_BASE}/health-advisory/${encodeURIComponent(station.name)}`)
       ]);
 
       if (currRes.ok) setStationReadings(await currRes.json());
       if (fcRes.ok) setForecastData(await fcRes.json());
       if (expRes.ok) setExplainData(await expRes.json());
+      if (corrRes.ok) setCorrelationData(await corrRes.json());
+      if (healthRes.ok) setHealthAdvisory(await healthRes.json());
     } catch (e) {
       console.error('Error fetching station details:', e);
     } finally {
@@ -3048,6 +3392,22 @@ export default function App() {
                 <Sparkles className="w-3.5 h-3.5 text-amber-400" />
                 <span>Why is pollution changing?</span>
               </button>
+              <button 
+                onClick={() => setActiveTab('correlation')}
+                className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                  activeTab === 'correlation' ? 'border-rose-500 text-rose-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}>
+                <Thermometer className="w-3.5 h-3.5 text-rose-400" />
+                <span>Temp vs PM2.5 Correlation</span>
+              </button>
+              <button 
+                onClick={() => setActiveTab('health')}
+                className={`pb-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+                  activeTab === 'health' ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}>
+                <HeartPulse className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Health Advisory</span>
+              </button>
 
               {nearbySources && nearbySources.sources && nearbySources.sources.length > 0 && (
                 <button 
@@ -3142,6 +3502,10 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+              ) : activeTab === 'correlation' ? (
+                <StationCorrelationChart correlationData={correlationData} stationName={modalStation.name} />
+              ) : activeTab === 'health' ? (
+                <StationHealthAdvisory advisoryData={healthAdvisory} />
               ) : activeTab === 'sources' && nearbySources && nearbySources.sources && nearbySources.sources.length > 0 ? (
                 <div className="space-y-4">
                   <div className="p-4 bg-slate-900 border-l-4 border-orange-500 rounded-r-xl">

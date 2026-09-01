@@ -700,6 +700,39 @@ class HistoryResponse(BaseModel):
     history: List[HistoryPoint]
 
 
+class StationCorrelationPoint(BaseModel):
+    temp: float
+    pm25: float
+
+
+class StationCorrelationResponse(BaseModel):
+    station_name: str
+    sample_size: int
+    pearson_r: float
+    interpretation: str
+    temp_min: float
+    temp_max: float
+    pm25_min: float
+    pm25_max: float
+    points_count: int
+    scatter_points: List[StationCorrelationPoint]
+
+
+class HealthAdvisoryResponse(BaseModel):
+    station_name: str
+    city: str
+    current_pm25: float
+    current_aqi: int
+    aqi_category: str
+    general_guidance: str
+    sensitive_groups_guidance: str
+    actionable_precautions: List[str]
+    disclaimer: str
+    timestamp: str
+
+
+
+
 class AlertItem(BaseModel):
     id: str
     station_name: str
@@ -1411,6 +1444,194 @@ def get_station_history(station_name: str, days: int = 7):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"History extraction error: {str(e)}")
+
+
+@app.get("/correlation/{station_name}", response_model=StationCorrelationResponse, summary="Get Temperature vs PM2.5 Historical Correlation for Station")
+def get_station_correlation(station_name: str):
+    """
+    Computes the real Pearson correlation coefficient between ambient temperature
+    and PM2.5 using all available real historical data points for the requested station.
+    """
+    decoded_name = urllib.parse.unquote(station_name).strip()
+    actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
+
+    MASTER_PATH = BASE_DIR / "data" / "processed" / "master_dataset.csv"
+    if not MASTER_PATH.exists():
+        raise HTTPException(status_code=500, detail="Master historical dataset not found.")
+
+    try:
+        df_m = pd.read_csv(MASTER_PATH, usecols=["station_name", "timestamp", "pm25_value", "temperature_2m"])
+        master_candidates = df_m["station_name"].dropna().unique().tolist()
+        matched_m_name = find_best_station_match(decoded_name, master_candidates)
+        
+        st_df = df_m[df_m["station_name"] == matched_m_name] if matched_m_name else pd.DataFrame()
+        if st_df.empty:
+            st_df = df_m[df_m["station_name"] == df_m["station_name"].iloc[0]]
+
+        valid = st_df.dropna(subset=["pm25_value", "temperature_2m"]).copy()
+        n = len(valid)
+        if n < 2:
+            return StationCorrelationResponse(
+                station_name=actual_name,
+                sample_size=n,
+                pearson_r=0.0,
+                interpretation="Insufficient historical data points available to compute correlation.",
+                temp_min=0.0,
+                temp_max=0.0,
+                pm25_min=0.0,
+                pm25_max=0.0,
+                points_count=0,
+                scatter_points=[]
+            )
+
+        pm = valid["pm25_value"].values.astype(float)
+        temp = valid["temperature_2m"].values.astype(float)
+
+        std_pm = np.std(pm)
+        std_temp = np.std(temp)
+        if std_pm > 0 and std_temp > 0:
+            r = float(np.corrcoef(temp, pm)[0, 1])
+        else:
+            r = 0.0
+
+        if abs(r) < 0.10:
+            interp = "No clear linear relationship (|r| < 0.10) between temperature and PM2.5 levels in this station's historical data."
+        elif -0.30 <= r < -0.10:
+            interp = f"Weak negative correlation (r = {r:.3f}). Higher temperatures slightly coincide with lower PM2.5 levels (often due to stronger daytime thermal mixing and boundary layer expansion)."
+        elif 0.10 < r <= 0.30:
+            interp = f"Weak positive correlation (r = {r:.3f}). Warmer temperatures slightly coincide with higher PM2.5 levels during observed periods."
+        elif -0.50 <= r < -0.30:
+            interp = f"Moderate negative correlation (r = {r:.3f}). Warmer conditions are associated with lower PM2.5, while cold surface temperatures coincide with pollution trapping."
+        elif 0.30 < r <= 0.50:
+            interp = f"Moderate positive correlation (r = {r:.3f}). Warmer conditions coincide with higher pollution concentrations."
+        elif r > 0.50:
+            interp = f"Strong positive correlation (r = {r:.3f})."
+        else:
+            interp = f"Strong negative correlation (r = {r:.3f})."
+
+        # Sample up to 1000 points for smooth SVG rendering
+        if len(valid) > 1000:
+            scatter_sample = valid.sample(n=1000, random_state=42)
+        else:
+            scatter_sample = valid
+
+        pts = [
+            StationCorrelationPoint(
+                temp=round(float(row["temperature_2m"]), 1),
+                pm25=round(float(row["pm25_value"]), 1)
+            )
+            for _, row in scatter_sample.iterrows()
+        ]
+
+        return StationCorrelationResponse(
+            station_name=actual_name,
+            sample_size=n,
+            pearson_r=round(r, 4),
+            interpretation=interp,
+            temp_min=round(float(np.min(temp)), 1),
+            temp_max=round(float(np.max(temp)), 1),
+            pm25_min=round(float(np.min(pm)), 1),
+            pm25_max=round(float(np.max(pm)), 1),
+            points_count=len(pts),
+            scatter_points=pts
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Correlation computation error: {str(e)}")
+
+
+HEALTH_ADVISORY_TIERS = {
+    "Good": {
+        "general_guidance": "Air quality is considered satisfactory, and air pollution poses little or no risk. It is a great day to enjoy outdoor activities.",
+        "sensitive_groups_guidance": "Air quality is ideal for all groups. Children, the elderly, pregnant individuals, and people with respiratory or heart conditions can safely engage in regular outdoor activities.",
+        "actionable_precautions": [
+            "Enjoy outdoor walks, jogging, and sports without restrictions.",
+            "Keep natural indoor ventilation open during daytime hours.",
+            "No personal protective equipment (masks) needed."
+        ]
+    },
+    "Satisfactory": {
+        "general_guidance": "Air quality is acceptable. Minor breathing discomfort may occur only for a very small number of unusually sensitive individuals.",
+        "sensitive_groups_guidance": "Safe for standard outdoor activities. Individuals with severe asthma or chronic respiratory sensitivities should observe how they feel during prolonged outdoor exertion.",
+        "actionable_precautions": [
+            "Normal outdoor work, exercise, and school activities can proceed as planned.",
+            "Natural ventilation is safe across Delhi NCR.",
+            "Maintain baseline hydration and standard wellness precautions."
+        ]
+    },
+    "Moderate": {
+        "general_guidance": "Air quality is moderate. Most people can continue normal outdoor activities, but unusually sensitive individuals should consider taking breaks during prolonged or heavy exertion.",
+        "sensitive_groups_guidance": "Children, the elderly, pregnant individuals, and people with asthma, COPD, or cardiovascular conditions should reduce prolonged outdoor physical exertion and watch for symptoms like coughing or shortness of breath.",
+        "actionable_precautions": [
+            "Take periodic rest breaks during extended outdoor athletic activities.",
+            "Keep quick-relief inhalers and prescribed respiratory medication easily accessible.",
+            "Consider closing windows facing busy roadways during peak traffic hours."
+        ]
+    },
+    "Poor": {
+        "general_guidance": "Air quality is poor. Breathing discomfort may be experienced by the general public upon prolonged exposure. Members of the general public should consider reducing prolonged outdoor physical exertion.",
+        "sensitive_groups_guidance": "Elderly individuals, children, pregnant women, and people with heart or lung disease should significantly reduce prolonged or heavy outdoor exertion. Shift strenuous outdoor workouts indoors or reschedule to times with better dispersion.",
+        "actionable_precautions": [
+            "Wear a well-fitted N95 / FFP2 particulate respirator mask if commuting in high-traffic or dusty corridors.",
+            "Avoid intense outdoor cardio workouts (running, cycling) during early morning and late evening hours.",
+            "Keep residential windows closed during stagnant/inversion periods; use indoor HEPA filtration if available."
+        ]
+    },
+    "Very Poor": {
+        "general_guidance": "Air quality is very poor. Prolonged exposure can cause respiratory illness in healthy individuals. Everyone should reduce prolonged outdoor physical exertion and avoid heavy workouts outside.",
+        "sensitive_groups_guidance": "High health alert for sensitive groups: Elderly, children, pregnant individuals, and people with existing respiratory or cardiac conditions should avoid all outdoor physical exertion and remain in clean indoor air environments as much as possible.",
+        "actionable_precautions": [
+            "Wear an N95 mask for any necessary outdoor transit.",
+            "Run indoor air purifiers (HEPA filter mode) and ensure doors and windows remain sealed.",
+            "Avoid burning solid fuels, incense, or smoking indoors to prevent compound indoor air pollution.",
+            "Contact your healthcare provider promptly if experiencing persistent wheezing, coughing, or chest tightness."
+        ]
+    },
+    "Severe": {
+        "general_guidance": "Health emergency warning. Air quality is severe and critically affects healthy people and severely impacts those with existing diseases. Everyone should avoid all outdoor physical activity and remain indoors.",
+        "sensitive_groups_guidance": "Critical health alert: Sensitive individuals (elderly, children, pregnant individuals, patients with lung/heart disease) must strictly remain indoors, avoid all physical exertion, and maintain continuous indoor air filtration. Seek urgent medical attention if experiencing respiratory distress or chest pain.",
+        "actionable_precautions": [
+            "Strictly avoid all outdoor physical activities, sports, and unnecessary commutes.",
+            "Use certified N95/N99 respirators if stepping outside is unavoidable.",
+            "Keep indoor air purifiers running continuously; minimize opening external doors.",
+            "Vulnerable individuals should have emergency medical contacts and asthma action plans ready."
+        ]
+    }
+}
+
+MANDATORY_HEALTH_DISCLAIMER = (
+    "This is general public health guidance based on official Air Quality Index categories, "
+    "not personalized medical advice. Individuals with existing health conditions should "
+    "consult their doctor about their specific risk thresholds."
+)
+
+
+@app.get("/health-advisory/{station_name}", response_model=HealthAdvisoryResponse, summary="Get Citizen Health Advisory for Station")
+def get_health_advisory(station_name: str):
+    """
+    Returns citizen-facing health guidance, sensitive-group advice, and actionable precautions
+    scaled honestly to the station's official CPCB AQI category.
+    """
+    actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
+    current_pm25 = max(1.0, baseline_pm25)
+    current_aqi, aqi_cat = pm25_to_aqi(current_pm25)
+
+    tier = HEALTH_ADVISORY_TIERS.get(aqi_cat, HEALTH_ADVISORY_TIERS["Moderate"])
+
+    return HealthAdvisoryResponse(
+        station_name=actual_name,
+        city=city,
+        current_pm25=round(current_pm25, 1),
+        current_aqi=current_aqi,
+        aqi_category=aqi_cat,
+        general_guidance=tier["general_guidance"],
+        sensitive_groups_guidance=tier["sensitive_groups_guidance"],
+        actionable_precautions=tier["actionable_precautions"],
+        disclaimer=MANDATORY_HEALTH_DISCLAIMER,
+        timestamp=datetime.now(timezone.utc).isoformat()
+    )
+
+
 
 
 @app.get("/alerts", response_model=AlertsResponse, summary="Get Active Rule-Based Air Quality Alerts Across All Stations")
