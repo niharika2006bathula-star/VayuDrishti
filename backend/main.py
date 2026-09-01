@@ -24,6 +24,7 @@ import urllib.parse
 import asyncio
 import subprocess
 import os
+import re
 
 import joblib
 import numpy as np
@@ -112,6 +113,50 @@ if MODEL_PATH.exists():
         print("[Backend] Successfully initialized and cached SHAP TreeExplainer")
     except Exception as e:
         print(f"[Backend Warning] Could not initialize model or TreeExplainer: {e}")
+
+# Load Uncertainty Buckets for Confidence Intervals
+UNCERTAINTY_BUCKETS_PATH = BASE_DIR / "data" / "processed" / "uncertainty_buckets.csv"
+uncertainty_buckets_data: List[Dict[str, Any]] = []
+
+if UNCERTAINTY_BUCKETS_PATH.exists():
+    try:
+        df_buckets = pd.read_csv(UNCERTAINTY_BUCKETS_PATH)
+        for _, row in df_buckets.iterrows():
+            b_name = str(row["bucket"]).strip()
+            parts = b_name.split("-")
+            low_v = float(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0.0
+            high_v = float(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 999999.0
+            uncertainty_buckets_data.append({
+                "bucket": b_name,
+                "min_pm25": low_v,
+                "max_pm25": high_v,
+                "lower_error": float(row["lower_error"]),  # e.g. -21.16
+                "upper_error": float(row["upper_error"]),  # e.g. +23.57
+                "samples": int(row["samples"]) if "samples" in row and pd.notna(row["samples"]) else 0
+            })
+        print(f"[Backend] Successfully loaded {len(uncertainty_buckets_data)} uncertainty buckets from {UNCERTAINTY_BUCKETS_PATH}")
+    except Exception as e:
+        print(f"[Backend Warning] Could not load uncertainty buckets: {e}")
+
+
+def get_confidence_bounds(predicted_pm25: float) -> tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+    """
+    Map predicted_pm25 to historical uncertainty bucket from uncertainty_buckets.csv.
+    Returns: (expected_low, expected_high, uncertainty_bucket, confidence_note)
+    """
+    for b in uncertainty_buckets_data:
+        min_v = b["min_pm25"]
+        max_v = b["max_pm25"]
+        is_match = (predicted_pm25 >= min_v if min_v == 0 else predicted_pm25 > min_v) and (predicted_pm25 <= max_v)
+        if is_match:
+            exp_low = max(0.0, round(predicted_pm25 + b["lower_error"], 2))
+            exp_high = round(predicted_pm25 + b["upper_error"], 2)
+            return exp_low, exp_high, b["bucket"], None
+
+    # Fallback for > 200 or ranges with insufficient historical samples
+    note = "Insufficient historical samples in this range to compute a reliable confidence interval"
+    bucket_label = "200+" if predicted_pm25 > 200 else "Out of Range"
+    return None, None, bucket_label, note
 
 # -----------------------------------------------------------------------------
 # Background Tasks — Safe Periodic Data Refresh (20-minute interval)
@@ -329,33 +374,102 @@ def load_forecast_weather() -> Optional[pd.DataFrame]:
     return None
 
 
+def normalize_station_name(name: str) -> str:
+    """Normalize station names for robust matching across dataset name variations (e.g. 'New Delhi' vs 'Delhi', 'DPCC', 'CPCB')."""
+    if not name:
+        return ""
+    clean = str(name).strip()
+    clean = re.sub(r'\bnew\b', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\bdelhi\b', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\bncr\b', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\bdpcc\b', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\bcpcb\b', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'[^a-zA-Z0-9]', '', clean).lower()
+    return clean
+
+
+def find_best_station_match(query: str, candidates: List[str]) -> Optional[str]:
+    """Finds best candidate match for a station name query."""
+    norm_q = normalize_station_name(query)
+    if not norm_q or not candidates:
+        return None
+
+    # 1. Exact normalized match
+    for cand in candidates:
+        if norm_q == normalize_station_name(cand):
+            return cand
+
+    # 2. Substring match on normalized core token
+    for cand in candidates:
+        norm_c = normalize_station_name(cand)
+        if norm_q in norm_c or norm_c in norm_q:
+            return cand
+
+    return None
+
+
+def resolve_station_info(station_name: str) -> tuple[str, str, float, float, float]:
+    """
+    Robustly resolves station identity, baseline PM2.5 (from live openaq_raw.csv or historical fallback),
+    and exact latitude/longitude coordinates.
+    Returns: (actual_name, city, baseline_pm25, latitude, longitude)
+    """
+    decoded_name = urllib.parse.unquote(station_name).strip()
+    df_raw = load_raw_data()
+    coords_map = get_station_coordinates_map()
+
+    # 1. Match in live raw openaq_raw.csv
+    raw_candidates = df_raw["location"].dropna().unique().tolist() if not df_raw.empty else []
+    matched_raw_name = find_best_station_match(decoded_name, raw_candidates)
+
+    baseline_pm25 = None
+    actual_name = decoded_name
+    city = "Delhi NCR"
+
+    if matched_raw_name:
+        matched = df_raw[df_raw["location"] == matched_raw_name]
+        actual_name = str(matched["location"].iloc[0])
+        city = str(matched["city"].iloc[0]) if "city" in matched.columns else "Delhi NCR"
+        pm25_row = matched[matched["parameter"].astype(str).str.lower() == "pm25"]
+        if not pm25_row.empty and pd.notna(pm25_row["value"].iloc[0]):
+            baseline_pm25 = float(pm25_row["value"].iloc[0])
+
+    # 2. If no live PM2.5 reading, fallback to historical dataset openaq_historical_pm25.csv
+    if baseline_pm25 is None and HISTORICAL_CSV_PATH.exists():
+        try:
+            df_hist = pd.read_csv(HISTORICAL_CSV_PATH)
+            hist_candidates = df_hist["station_name"].dropna().unique().tolist()
+            matched_hist_name = find_best_station_match(decoded_name, hist_candidates)
+            if matched_hist_name:
+                h_rows = df_hist[df_hist["station_name"] == matched_hist_name]
+                pm_h = h_rows["pm25_value"].dropna()
+                if not pm_h.empty:
+                    baseline_pm25 = float(pm_h.iloc[-1])
+                    if actual_name == decoded_name:
+                        actual_name = matched_hist_name
+        except Exception as e:
+            print(f"[Backend Warning] Error reading historical CSV fallback: {e}")
+
+    if baseline_pm25 is None:
+        baseline_pm25 = 50.0
+
+    # 3. Match coordinates map with normalized lookup
+    coords_candidates = list(coords_map.keys())
+    matched_coord_name = find_best_station_match(decoded_name, coords_candidates)
+    coords = coords_map.get(matched_coord_name, {"latitude": 28.6139, "longitude": 77.2090}) if matched_coord_name else {"latitude": 28.6139, "longitude": 77.2090}
+    st_lat = float(coords.get("latitude", 28.6139))
+    st_lon = float(coords.get("longitude", 77.2090))
+
+    return actual_name, city, baseline_pm25, st_lat, st_lon
+
+
 def extract_station_current_features(station_name: str) -> tuple[str, str, float, pd.DataFrame]:
     """
     Extracts the current feature vector for a given station name, matching the
     feature construction logic in /forecast.
     Returns: (actual_station_name, city, current_pm25, feature_dataframe)
     """
-    decoded_name = urllib.parse.unquote(station_name).strip()
-    df_raw = load_raw_data()
-    coords_map = get_station_coordinates_map()
-
-    matched = df_raw[df_raw["location"].str.strip().str.lower() == decoded_name.lower()]
-    if matched.empty:
-        matched = df_raw[df_raw["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
-
-    if not matched.empty:
-        actual_name = str(matched["location"].iloc[0])
-        city = str(matched["city"].iloc[0]) if "city" in matched.columns else "Delhi NCR"
-        pm25_row = matched[matched["parameter"].astype(str).str.lower() == "pm25"]
-        baseline_pm25 = float(pm25_row["value"].iloc[0]) if (not pm25_row.empty and pd.notna(pm25_row["value"].iloc[0])) else 50.0
-    else:
-        actual_name = decoded_name
-        city = "Delhi NCR"
-        baseline_pm25 = 50.0
-
-    coords = coords_map.get(actual_name, {"latitude": 28.6139, "longitude": 77.2090})
-    st_lat = float(coords.get("latitude", 28.6139))
-    st_lon = float(coords.get("longitude", 77.2090))
+    actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
 
     now_utc = datetime.now(timezone.utc)
     hour_val = now_utc.hour
@@ -464,6 +578,10 @@ class ForecastHour(BaseModel):
     predicted_aqi: int
     unit: str = "µg/m³"
     aqi_category: str
+    expected_low: Optional[float] = None
+    expected_high: Optional[float] = None
+    uncertainty_bucket: Optional[str] = None
+    confidence_note: Optional[str] = None
 
 
 class ForecastResponse(BaseModel):
@@ -725,7 +843,8 @@ def get_stations():
         else:
             latest_ts = str(group["timestamp"].iloc[0]) if "timestamp" in group.columns else None
 
-        coords = coords_map.get(str(station_name), {})
+        matched_coord_name = find_best_station_match(str(station_name), list(coords_map.keys()))
+        coords = coords_map.get(matched_coord_name, {}) if matched_coord_name else {}
 
         stations_list.append(
             StationSummary(
@@ -751,9 +870,9 @@ def get_current_station_readings(station_name: str):
     df = load_raw_data()
     coords_map = get_station_coordinates_map()
 
-    matched = df[df["location"].str.strip().str.lower() == decoded_name.lower()]
-    if matched.empty:
-        matched = df[df["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
+    raw_candidates = df["location"].dropna().unique().tolist() if not df.empty else []
+    matched_name = find_best_station_match(decoded_name, raw_candidates)
+    matched = df[df["location"] == matched_name] if matched_name else pd.DataFrame()
 
     if matched.empty:
         available_stations = sorted(df["location"].dropna().unique().tolist())
@@ -909,6 +1028,7 @@ def generate_autoregressive_forecast(
 
         pm_history.append(pred_val)
         pred_aqi, aqi_cat = pm25_to_aqi(pred_val)
+        exp_low, exp_high, bucket_name, conf_note = get_confidence_bounds(pred_val)
 
         forecast_list.append(
             ForecastHour(
@@ -917,7 +1037,11 @@ def generate_autoregressive_forecast(
                 predicted_pm25=pred_val,
                 predicted_aqi=pred_aqi,
                 unit="µg/m³",
-                aqi_category=aqi_cat
+                aqi_category=aqi_cat,
+                expected_low=exp_low,
+                expected_high=exp_high,
+                uncertainty_bucket=bucket_name,
+                confidence_note=conf_note
             )
         )
     return forecast_list
@@ -995,27 +1119,7 @@ def get_forecast_for_station(station_name: str):
     real Open-Meteo hour-by-hour forecast weather, and official CPCB AQI.
     """
     decoded_name = urllib.parse.unquote(station_name).strip()
-    df_raw = load_raw_data()
-    coords_map = get_station_coordinates_map()
-
-    # Find station in current readings
-    matched = df_raw[df_raw["location"].str.strip().str.lower() == decoded_name.lower()]
-    if matched.empty:
-        matched = df_raw[df_raw["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
-
-    if not matched.empty:
-        actual_name = str(matched["location"].iloc[0])
-        city = str(matched["city"].iloc[0]) if "city" in matched.columns else "Delhi NCR"
-        pm25_row = matched[matched["parameter"].astype(str).str.lower() == "pm25"]
-        baseline_pm25 = float(pm25_row["value"].iloc[0]) if (not pm25_row.empty and pd.notna(pm25_row["value"].iloc[0])) else 50.0
-    else:
-        actual_name = decoded_name
-        city = "Delhi NCR"
-        baseline_pm25 = 50.0
-
-    coords = coords_map.get(actual_name, {"latitude": 28.6139, "longitude": 77.2090})
-    st_lat = coords.get("latitude", 28.6139)
-    st_lon = coords.get("longitude", 77.2090)
+    actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
 
     now_utc = datetime.now(timezone.utc)
     forecast_list = []
@@ -1204,11 +1308,7 @@ def get_station_history(station_name: str, days: int = 7):
     master dataset for the requested station and day range (7 or 30 days).
     """
     decoded_name = urllib.parse.unquote(station_name).strip()
-    df_raw = load_raw_data()
-    matched = df_raw[df_raw["location"].str.strip().str.lower() == decoded_name.lower()]
-    if matched.empty:
-        matched = df_raw[df_raw["location"].str.strip().str.lower().str.contains(decoded_name.lower())]
-    actual_name = str(matched["location"].iloc[0]) if not matched.empty else decoded_name
+    actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
 
     MASTER_PATH = BASE_DIR / "data" / "processed" / "master_dataset.csv"
     if not MASTER_PATH.exists():
@@ -1216,12 +1316,12 @@ def get_station_history(station_name: str, days: int = 7):
 
     try:
         df_m = pd.read_csv(MASTER_PATH, usecols=["station_name", "timestamp", "pm25_value", "temperature_2m"])
-        st_df = df_m[df_m["station_name"] == actual_name].sort_values("timestamp")
-
+        master_candidates = df_m["station_name"].dropna().unique().tolist()
+        matched_m_name = find_best_station_match(decoded_name, master_candidates)
+        
+        st_df = df_m[df_m["station_name"] == matched_m_name].sort_values("timestamp") if matched_m_name else pd.DataFrame()
         if st_df.empty:
-            st_df = df_m[df_m["station_name"].str.contains(actual_name.split(",")[0], case=False, na=False)].sort_values("timestamp")
-            if st_df.empty:
-                st_df = df_m[df_m["station_name"] == df_m["station_name"].iloc[0]].sort_values("timestamp")
+            st_df = df_m[df_m["station_name"] == df_m["station_name"].iloc[0]].sort_values("timestamp")
 
         hours_needed = min(len(st_df), max(24, days * 24))
         sub_df = st_df.tail(hours_needed)
@@ -2003,24 +2103,13 @@ def get_nearby_sources(station_name: str):
     coords_map = get_station_coordinates_map()
     decoded_name = urllib.parse.unquote(station_name).strip()
     
-    # Try to find exactly, or fallback to partial match
-    target = None
-    for name, coords in coords_map.items():
-        if name.lower() == decoded_name.lower():
-            target = {"name": name, "coords": coords}
-            break
-    
-    if not target:
-        for name, coords in coords_map.items():
-            if decoded_name.lower() in name.lower():
-                target = {"name": name, "coords": coords}
-                break
-                
-    if not target:
+    matched_coord_name = find_best_station_match(decoded_name, list(coords_map.keys()))
+    if not matched_coord_name or matched_coord_name not in coords_map:
         raise HTTPException(status_code=404, detail="Station coordinates not found.")
         
-    lat = target["coords"]["latitude"]
-    lon = target["coords"]["longitude"]
+    coords = coords_map[matched_coord_name]
+    lat = coords["latitude"]
+    lon = coords["longitude"]
     
     cache_key = f"{lat},{lon}"
     import time
@@ -2029,7 +2118,7 @@ def get_nearby_sources(station_name: str):
     if cache_key in _OVERPASS_CACHE:
         cached_data, timestamp = _OVERPASS_CACHE[cache_key]
         if now - timestamp < _OVERPASS_CACHE_TTL:
-            return NearbySourcesResponse(station=target["name"], sources=cached_data)
+            return NearbySourcesResponse(station=matched_coord_name, sources=cached_data)
             
     # Query Overpass
     overpass_url = "https://overpass-api.de/api/interpreter"
@@ -2140,12 +2229,12 @@ def get_nearby_sources(station_name: str):
         if not sorted_sources:
             msg = "No tagged industrial sources found within 7km."
             
-        return NearbySourcesResponse(station=target["name"], sources=sorted_sources, message=msg)
+        return NearbySourcesResponse(station=matched_coord_name, sources=sorted_sources, message=msg)
         
     except Exception as e:
         print(f"Overpass API error: {e}")
         return NearbySourcesResponse(
-            station=target["name"], 
+            station=matched_coord_name, 
             sources=[], 
             message="Could not fetch nearby sources at this time."
         )

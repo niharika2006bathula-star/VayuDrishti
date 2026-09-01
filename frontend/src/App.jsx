@@ -41,7 +41,8 @@ import {
   Compass,
   Briefcase,
   ShieldCheck,
-  Factory
+  Factory,
+  BookOpen
 } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
@@ -673,6 +674,31 @@ export default function App() {
       setIsSimulating(false);
     }
   };
+
+  const simDiffs = useMemo(() => {
+    if (!simResults || !simResults.baseline_forecast || !simResults.feedback_forecast) return [];
+    return simResults.baseline_forecast.map((b, i) => {
+      const f = simResults.feedback_forecast[i];
+      const diff = f - b;
+      return {
+        hour: i + 1,
+        baseline: b,
+        feedback: f,
+        diff,
+        isTriggered: Math.abs(diff) >= 0.01
+      };
+    });
+  }, [simResults]);
+
+  const simSummaryStats = useMemo(() => {
+    if (!simDiffs.length) return { triggerCount: 0, maxAdjustment: '0.00' };
+    const triggered = simDiffs.filter(d => d.isTriggered);
+    const maxAdj = Math.max(0, ...simDiffs.map(d => Math.abs(d.diff)));
+    return {
+      triggerCount: triggered.length,
+      maxAdjustment: maxAdj.toFixed(2)
+    };
+  }, [simDiffs]);
 
   const [alertsData, setAlertsData] = useState(null);
 
@@ -2674,7 +2700,164 @@ export default function App() {
                     )}
                   </div>
                 </div>
+
+                {/* PART 1 — Numeric Delta Readout Table */}
+                {simResults && (
+                  <div className="mt-8 pt-6 border-t border-slate-800 space-y-4">
+                    {/* One-Line Summary Banner */}
+                    <div className="p-3.5 bg-cyan-950/40 border border-cyan-500/30 rounded-xl text-cyan-300 text-xs font-medium flex items-center gap-2.5">
+                      <Sparkles className="w-4.5 h-4.5 text-cyan-400 shrink-0" />
+                      <span>
+                        Feedback mechanism triggered for <strong className="text-white underline decoration-cyan-500">{simSummaryStats.triggerCount}</strong> of the 24 simulated hours, with a maximum observed adjustment of <strong className="text-white underline decoration-rose-500">{simSummaryStats.maxAdjustment} µg/m³</strong>.
+                      </span>
+                    </div>
+
+                    {/* Hourly Readout Table */}
+                    <div>
+                      <div className="text-xs font-bold text-slate-300 mb-2.5 flex items-center justify-between">
+                        <span>Hourly Numeric Readout (First 6 Hours & Active Deltas)</span>
+                        <span className="text-[10px] text-slate-500 font-normal">Non-zero feedback adjustments highlighted</span>
+                      </div>
+                      <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/60 max-h-72 overflow-y-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-slate-900/90 text-slate-400 font-semibold border-b border-slate-800 sticky top-0 backdrop-blur-md">
+                            <tr>
+                              <th className="p-2.5">Hour</th>
+                              <th className="p-2.5">Baseline PM2.5</th>
+                              <th className="p-2.5">Feedback PM2.5</th>
+                              <th className="p-2.5">Difference (Feedback − Baseline)</th>
+                              <th className="p-2.5 text-right">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60 font-mono text-[11px]">
+                            {simDiffs.map((row) => (
+                              <tr key={row.hour} className={row.isTriggered ? "bg-rose-950/40 font-bold border-l-2 border-rose-500" : "hover:bg-slate-900/40 text-slate-400"}>
+                                <td className="p-2.5 text-slate-300 font-sans font-semibold">Hour {row.hour}</td>
+                                <td className="p-2.5 text-slate-300">{row.baseline.toFixed(2)} µg/m³</td>
+                                <td className={row.isTriggered ? "p-2.5 text-rose-300 font-bold" : "p-2.5 text-slate-300"}>
+                                  {row.feedback.toFixed(2)} µg/m³
+                                </td>
+                                <td className={row.isTriggered ? "p-2.5 text-rose-400 font-bold" : "p-2.5 text-slate-500"}>
+                                  {row.diff > 0 ? `+${row.diff.toFixed(2)}` : row.diff.toFixed(2)} µg/m³
+                                </td>
+                                <td className="p-2.5 text-right font-sans">
+                                  {row.isTriggered ? (
+                                    <span className="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[10px] font-bold inline-flex items-center gap-1">
+                                      ⚡ Triggered ({row.diff > 0 ? `+${row.diff.toFixed(2)}` : row.diff.toFixed(2)})
+                                    </span>
+                                  ) : (
+                                    <span className="px-2 py-0.5 rounded-full bg-slate-900 text-slate-500 text-[10px]">
+                                      Unchanged
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
+
+              {/* PART 2 — Research & Evidence Collapsible Card */}
+              <details className="group bg-[#0F172A] border border-slate-800 rounded-2xl shadow-xl overflow-hidden transition-all mb-6" open>
+                <summary className="p-5 font-bold text-sm text-white cursor-pointer bg-slate-900/80 hover:bg-slate-900 flex items-center justify-between border-b border-slate-800/80 select-none">
+                  <div className="flex items-center gap-2.5">
+                    <BookOpen className="w-5 h-5 text-cyan-400" />
+                    <span className="text-base font-heading">Research & Evidence Behind This Feature</span>
+                  </div>
+                  <span className="text-xs text-slate-400 group-open:rotate-180 transition-transform">▼</span>
+                </summary>
+
+                <div className="p-6 space-y-6 text-xs text-slate-300">
+                  
+                  {/* 1. Module Verification */}
+                  <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800/80 space-y-3">
+                    <h4 className="font-bold text-cyan-400 text-sm flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      1. Module Verification (Isolated Unit Testing)
+                    </h4>
+                    <p className="text-slate-400 leading-relaxed">
+                      The standalone <code className="text-cyan-300 font-mono">aerosol_feedback.py</code> module was verified in isolation using 4 distinct test scenarios (from <code className="text-slate-400 font-mono">scripts/test_aerosol_feedback.py</code>) to confirm correct conditional execution:
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 font-mono text-[11px]">
+                      <div className="p-3 bg-slate-900/80 rounded-lg border border-emerald-500/30">
+                        <div className="font-bold text-emerald-400 font-sans mb-1">Scenario 1: High PM2.5, Low Wind (Stagnant)</div>
+                        <div className="text-slate-300">Inputs: PM2.5 = 200 µg/m³, Wind = 1.5 m/s, Initial PBL = 500m</div>
+                        <div className="text-cyan-300 font-bold mt-1">Result: Adjusted PBL = 440.0m (12.0% Reduction) ✓</div>
+                      </div>
+
+                      <div className="p-3 bg-slate-900/80 rounded-lg border border-slate-800">
+                        <div className="font-bold text-slate-300 font-sans mb-1">Scenario 2: Low PM2.5, High Wind (Clear)</div>
+                        <div className="text-slate-400">Inputs: PM2.5 = 50 µg/m³, Wind = 3.0 m/s, Initial PBL = 800m</div>
+                        <div className="text-slate-400 font-bold mt-1">Result: Adjusted PBL = 800.0m (Unchanged / 0% Change) ✓</div>
+                      </div>
+
+                      <div className="p-3 bg-slate-900/80 rounded-lg border border-emerald-500/30">
+                        <div className="font-bold text-emerald-400 font-sans mb-1">Scenario 3: High PM2.5, Very Low Wind (Stagnant)</div>
+                        <div className="text-slate-300">Inputs: PM2.5 = 180 µg/m³, Wind = 1.0 m/s, Initial PBL = 600m</div>
+                        <div className="text-cyan-300 font-bold mt-1">Result: Adjusted PBL = 528.0m (12.0% Reduction) ✓</div>
+                      </div>
+
+                      <div className="p-3 bg-slate-900/80 rounded-lg border border-slate-800">
+                        <div className="font-bold text-slate-300 font-sans mb-1">Scenario 4: High PM2.5, High Wind (Not Stagnant)</div>
+                        <div className="text-slate-400">Inputs: PM2.5 = 160 µg/m³, Wind = 2.5 m/s, Initial PBL = 500m</div>
+                        <div className="text-slate-400 font-bold mt-1">Result: Adjusted PBL = 500.0m (Unchanged / 0% Change) ✓</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 2. Scientific Basis */}
+                  <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800/80 space-y-3">
+                    <h4 className="font-bold text-cyan-400 text-sm flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-cyan-400" />
+                      2. Scientific Basis (Published Atmospheric Literature)
+                    </h4>
+                    <p className="text-slate-300 leading-relaxed">
+                      Published numerical modeling research using <strong>WRF-Chem (Weather Research and Forecasting model coupled with Chemistry)</strong> over Delhi NCR demonstrates that dense aerosol loading suppresses incoming solar radiation reaching the ground. This surface cooling stabilizes the lower boundary layer, weakening convective turbulence and confining pollutants to the lowest <strong>400–500m</strong> of the atmosphere.
+                    </p>
+                    <p className="text-slate-300 leading-relaxed">
+                      During severe winter smog episodes, this positive aerosol-radiation feedback loop can amplify PM2.5 peak concentrations from baseline levels of <strong>~100 µg/m³ up to ~300 µg/m³</strong>.
+                    </p>
+                    <div className="p-3 bg-cyan-950/30 border border-cyan-500/30 rounded-lg text-[11px] text-cyan-300 italic">
+                      <strong>Important Clarification:</strong> Our module applies a literature-informed 12% boundary layer suppression proxy under stagnant conditions (PM2.5 &gt; 150 µg/m³, wind &lt; 2.0 m/s). This is an illustrative, educational proxy informed by scientific literature, not a claim of replicating full 3D physical atmospheric radiative chemistry.
+                    </div>
+                  </div>
+
+                  {/* 3. Empirical Test on Our Own Data */}
+                  <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800/80 space-y-3">
+                    <h4 className="font-bold text-cyan-400 text-sm flex items-center gap-2">
+                      <Database className="w-4 h-4 text-purple-400" />
+                      3. Empirical Test on Our Own Dataset (Statistical Reality Check)
+                    </h4>
+                    <p className="text-slate-300 leading-relaxed">
+                      We conducted an empirical correlation analysis on our training dataset containing <strong>N = 92,719</strong> hourly station observations (spanning May 1 to July 31, 2026):
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-center font-mono">
+                      <div className="p-3 bg-slate-900 rounded-lg border border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-sans font-semibold">PM2.5 vs. PBL Height Correlation</div>
+                        <div className="text-lg font-bold text-purple-300 mt-1">r = -0.0003</div>
+                        <div className="text-[10px] text-slate-400 font-sans">N = 92,719 observations</div>
+                      </div>
+                      <div className="p-3 bg-slate-900 rounded-lg border border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-sans font-semibold">PM2.5 vs. 1-Hour PBL Change (ΔPBL)</div>
+                        <div className="text-lg font-bold text-purple-300 mt-1">r = -0.0163</div>
+                        <div className="text-[10px] text-slate-400 font-sans">N = 92,718 observations (r &lt; 0.03)</div>
+                      </div>
+                    </div>
+                    <p className="text-slate-400 leading-relaxed">
+                      <strong>Honest Explanation of Findings:</strong> This near-zero empirical correlation in our training data is completely expected due to two primary factors:
+                    </p>
+                    <ul className="list-disc list-inside space-y-1.5 text-slate-400 pl-2">
+                      <li><strong>Seasonal Scope:</strong> Aerosol-PBL feedback is a documented winter smog phenomenon driven by strong thermal inversions. Our dataset spans summer and monsoon months, where atmospheric dynamics are dominated by intense solar convection and rain washout.</li>
+                      <li><strong>Data Source Limitations:</strong> Reanalysis and Open-Meteo boundary layer height calculations rely on large-scale meteorological models that do not dynamically absorb real-time local ground station PM2.5 optical depth.</li>
+                    </ul>
+                  </div>
+
+                </div>
+              </details>
             </div>
           )}
           {navTab === 'settings' && (
@@ -2910,22 +3093,41 @@ export default function App() {
                   </div>
 
                   <div className="space-y-2">
-                    <div className="text-xs font-semibold text-slate-300 mb-2">Hourly Trajectory Preview (Next 72 Hours)</div>
+                    <div className="flex items-center justify-between text-xs font-semibold text-slate-300 mb-2">
+                      <span>Hourly Trajectory Preview (Next 72 Hours)</span>
+                      <span className="text-[10px] text-cyan-400 font-medium bg-cyan-950/60 border border-cyan-500/30 px-2 py-0.5 rounded-full">
+                        📊 Empirical 95% Confidence Bounds
+                      </span>
+                    </div>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 max-h-72 overflow-y-auto pr-1">
                       {forecastData?.forecast?.map((fc, i) => {
                         const theme = getPM25Theme(fc.predicted_pm25);
                         return (
-                          <div key={i} className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs">
-                            <div className="text-[11px] text-slate-400 flex items-center justify-between">
-                              <span>+ {fc.hour_offset}h</span>
-                              <span className={`text-[10px] px-1.5 py-0.2 rounded font-semibold ${theme.badge}`}>
-                                AQI {fc.predicted_aqi}
-                              </span>
+                          <div key={i} className="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800 text-xs flex flex-col justify-between">
+                            <div>
+                              <div className="text-[11px] text-slate-400 flex items-center justify-between">
+                                <span>+ {fc.hour_offset}h</span>
+                                <span className={`text-[10px] px-1.5 py-0.2 rounded font-semibold ${theme.badge}`}>
+                                  AQI {fc.predicted_aqi}
+                                </span>
+                              </div>
+                              <div className="text-base font-bold text-white mt-1">
+                                {fc.predicted_pm25} <span className="text-[10px] text-slate-400 font-normal">µg/m³</span>
+                              </div>
+
+                              {/* Confidence Interval / Fallback Note */}
+                              {fc.expected_low !== null && fc.expected_high !== null ? (
+                                <div className="text-[10px] text-cyan-300 font-mono mt-1 bg-cyan-950/40 px-1.5 py-0.5 rounded border border-cyan-500/20">
+                                  {fc.expected_low}–{fc.expected_high} <span className="text-[9px] text-slate-400 font-sans">({fc.uncertainty_bucket})</span>
+                                </div>
+                              ) : (
+                                <div className="text-[9px] text-amber-300 font-sans italic mt-1 bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-500/30" title={fc.confidence_note || "Insufficient historical samples in this range to compute a reliable confidence interval"}>
+                                  ⚠️ No range (&gt;200)
+                                </div>
+                              )}
                             </div>
-                            <div className="text-base font-bold text-white mt-1">
-                              {fc.predicted_pm25} <span className="text-[10px] text-slate-400 font-normal">µg/m³</span>
-                            </div>
-                            <div className="text-[10px] text-slate-400 mt-0.5 flex items-center justify-between">
+
+                            <div className="text-[10px] text-slate-400 mt-2 pt-1 border-t border-slate-800/60 flex items-center justify-between">
                               <span>{new Date(fc.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit' })}</span>
                               <span className="text-[9px] text-slate-500">{fc.aqi_category}</span>
                             </div>
