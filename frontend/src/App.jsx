@@ -3452,10 +3452,22 @@ export default function App() {
                 </div>
               ) : activeTab === 'forecast' ? (
                 <div>
-                  <div className="p-3 bg-cyan-950/30 border border-cyan-500/30 rounded-xl text-cyan-300 text-xs mb-4 flex items-center gap-2">
+                  <div className="p-3 bg-cyan-950/30 border border-cyan-500/30 rounded-xl text-cyan-300 text-xs mb-3 flex items-center gap-2">
                     <Info className="w-4 h-4 shrink-0" />
                     <span>{forecastData?.note || '72-hour forecast based on XGBoost autoregressive simulation.'}</span>
                   </div>
+
+                  {forecastData?.lag_history_quality && (
+                    <div className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs mb-4">
+                      <div className="flex items-center gap-2 text-slate-300">
+                        <Database className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        <span>Autoregressive Feature History:</span>
+                      </div>
+                      <span className="text-[11px] font-mono font-medium px-2 py-0.5 rounded bg-cyan-950/70 text-cyan-300 border border-cyan-500/30">
+                        {forecastData.lag_history_quality}
+                      </span>
+                    </div>
+                  )}
 
                   <div className="space-y-2">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-300 mb-2">

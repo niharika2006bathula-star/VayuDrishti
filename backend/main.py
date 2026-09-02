@@ -64,6 +64,7 @@ app.add_middleware(
 RAW_CSV_PATH = BASE_DIR / "data" / "raw" / "openaq_raw.csv"
 RAW_JSON_PATH = BASE_DIR / "data" / "raw" / "openaq_raw.json"
 HISTORICAL_CSV_PATH = BASE_DIR / "data" / "raw" / "openaq_historical_pm25.csv"
+LIVE_HISTORY_CSV_PATH = BASE_DIR / "data" / "raw" / "openaq_live_history.csv"
 FORECAST_WEATHER_CSV_PATH = BASE_DIR / "data" / "raw" / "openmeteo_forecast_delhi.csv"
 ML_DATASET_PATH = BASE_DIR / "data" / "processed" / "ml_dataset.csv"
 MODEL_PATH = BASE_DIR / "models" / "pm25_xgboost_model.pkl"
@@ -509,11 +510,109 @@ def resolve_station_info(station_name: str) -> tuple[str, str, float, float, flo
     return actual_name, city, baseline_pm25, st_lat, st_lon
 
 
-def extract_station_current_features(station_name: str) -> tuple[str, str, float, pd.DataFrame]:
+def get_station_accumulated_lags(
+    station_name: str,
+    current_pm: float,
+    now_utc: datetime
+) -> tuple[Dict[str, float], int, int, str]:
+    """
+    Extracts lag (1, 3, 6, 12, 24h) and rolling mean (3, 6, 12, 24h) features for a station.
+    Checks data/raw/openaq_live_history.csv for real historical readings within a tolerance window.
+    Falls back honestly to current_pm if insufficient history has accumulated.
+    
+    Returns:
+        (lag_features_dict, real_lags_count, fallback_lags_count, quality_string)
+    """
+    lag_dict = {
+        "pm25_lag_1": float(current_pm),
+        "pm25_lag_3": float(current_pm),
+        "pm25_lag_6": float(current_pm),
+        "pm25_lag_12": float(current_pm),
+        "pm25_lag_24": float(current_pm),
+        "pm25_roll_3": float(current_pm),
+        "pm25_roll_6": float(current_pm),
+        "pm25_roll_12": float(current_pm),
+        "pm25_roll_24": float(current_pm),
+    }
+    real_flags = {k: False for k in lag_dict.keys()}
+
+    if not LIVE_HISTORY_CSV_PATH.exists():
+        return lag_dict, 0, 9, "0/9 fallback (history accumulating)"
+
+    try:
+        history_df = pd.read_csv(LIVE_HISTORY_CSV_PATH)
+        if history_df.empty or "station_name" not in history_df.columns or "pm25_value" not in history_df.columns:
+            return lag_dict, 0, 9, "0/9 fallback (history accumulating)"
+
+        candidates = history_df["station_name"].dropna().unique().tolist()
+        matched_name = find_best_station_match(station_name, candidates)
+        if not matched_name:
+            return lag_dict, 0, 9, "0/9 fallback (station not found in live history)"
+
+        st_df = history_df[history_df["station_name"] == matched_name].copy()
+        if st_df.empty:
+            return lag_dict, 0, 9, "0/9 fallback (station has 0 history rows)"
+
+        st_df["dt"] = pd.to_datetime(st_df["timestamp"], errors="coerce", utc=True)
+        st_df = st_df.dropna(subset=["dt", "pm25_value"]).sort_values("dt")
+        if st_df.empty:
+            return lag_dict, 0, 9, "0/9 fallback (no valid timestamps)"
+
+        # Check each lag hour offset
+        # Lag 1: 1h ago (tolerance 45m)
+        # Lag 3: 3h ago (tolerance 60m)
+        # Lag 6: 6h ago (tolerance 90m)
+        # Lag 12: 12h ago (tolerance 120m)
+        # Lag 24: 24h ago (tolerance 180m)
+        lag_tolerances = {
+            1: (timedelta(hours=1), timedelta(minutes=45)),
+            3: (timedelta(hours=3), timedelta(minutes=60)),
+            6: (timedelta(hours=6), timedelta(minutes=90)),
+            12: (timedelta(hours=12), timedelta(minutes=120)),
+            24: (timedelta(hours=24), timedelta(minutes=180)),
+        }
+
+        for lag_h, (offset, tol) in lag_tolerances.items():
+            target_dt = now_utc - offset
+            diffs = (st_df["dt"] - target_dt).abs()
+            min_idx = diffs.argmin()
+            min_diff = diffs.iloc[min_idx]
+            if min_diff <= tol:
+                val = float(st_df["pm25_value"].iloc[min_idx])
+                lag_dict[f"pm25_lag_{lag_h}"] = round(val, 2)
+                real_flags[f"pm25_lag_{lag_h}"] = True
+
+        # Check rolling windows
+        # roll_3, roll_6, roll_12, roll_24
+        for roll_h in [3, 6, 12, 24]:
+            win_start = now_utc - timedelta(hours=roll_h)
+            pts = st_df[(st_df["dt"] >= win_start) & (st_df["dt"] <= now_utc)]["pm25_value"].tolist()
+            if len(pts) >= 1:
+                all_pts = pts + [float(current_pm)]
+                lag_dict[f"pm25_roll_{roll_h}"] = round(float(np.mean(all_pts)), 2)
+                real_flags[f"pm25_roll_{roll_h}"] = True
+
+        real_count = sum(1 for v in real_flags.values() if v)
+        fallback_count = 9 - real_count
+        if real_count == 9:
+            quality_str = "9/9 full live history"
+        elif real_count > 0:
+            quality_str = f"{real_count}/9 live history ({fallback_count}/9 fallback)"
+        else:
+            quality_str = "0/9 fallback (history accumulating)"
+
+        return lag_dict, real_count, fallback_count, quality_str
+
+    except Exception as e:
+        print(f"[Warning] Error extracting accumulated lags for {station_name}: {e}")
+        return lag_dict, 0, 9, f"0/9 fallback (error: {str(e)[:40]})"
+
+
+def extract_station_current_features(station_name: str) -> tuple[str, str, float, pd.DataFrame, int, int, str]:
     """
     Extracts the current feature vector for a given station name, matching the
-    feature construction logic in /forecast.
-    Returns: (actual_station_name, city, current_pm25, feature_dataframe)
+    feature construction logic in /forecast with live accumulated lags.
+    Returns: (actual_station_name, city, current_pm25, feature_dataframe, real_lags_count, fallback_lags_count, quality_str)
     """
     actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
 
@@ -562,17 +661,22 @@ def extract_station_current_features(station_name: str) -> tuple[str, str, float
 
     current_pm = max(5.0, baseline_pm25)
 
+    # Get real accumulated lags
+    lag_dict, real_count, fallback_count, quality_str = get_station_accumulated_lags(
+        actual_name, current_pm, now_utc
+    )
+
     feature_dict = {
         "pm25_value": float(current_pm),
-        "pm25_lag_1": float(current_pm),
-        "pm25_lag_3": float(current_pm),
-        "pm25_lag_6": float(current_pm),
-        "pm25_lag_12": float(current_pm),
-        "pm25_lag_24": float(current_pm),
-        "pm25_roll_3": float(current_pm),
-        "pm25_roll_6": float(current_pm),
-        "pm25_roll_12": float(current_pm),
-        "pm25_roll_24": float(current_pm),
+        "pm25_lag_1": lag_dict["pm25_lag_1"],
+        "pm25_lag_3": lag_dict["pm25_lag_3"],
+        "pm25_lag_6": lag_dict["pm25_lag_6"],
+        "pm25_lag_12": lag_dict["pm25_lag_12"],
+        "pm25_lag_24": lag_dict["pm25_lag_24"],
+        "pm25_roll_3": lag_dict["pm25_roll_3"],
+        "pm25_roll_6": lag_dict["pm25_roll_6"],
+        "pm25_roll_12": lag_dict["pm25_roll_12"],
+        "pm25_roll_24": lag_dict["pm25_roll_24"],
         "temperature_2m": temp,
         "relative_humidity_2m": humidity,
         "wind_speed_10m": wind_spd,
@@ -594,7 +698,8 @@ def extract_station_current_features(station_name: str) -> tuple[str, str, float
     }
 
     feature_df = pd.DataFrame([feature_dict])[MODEL_FEATURES]
-    return actual_name, city, current_pm, feature_df
+    return actual_name, city, current_pm, feature_df, real_count, fallback_count, quality_str
+
 
 
 # -----------------------------------------------------------------------------
@@ -655,6 +760,10 @@ class ForecastResponse(BaseModel):
     current_aqi_category: str
     forecast_hours: int = 72
     forecast: List[ForecastHour]
+    real_lags_count: Optional[int] = 0
+    fallback_lags_count: Optional[int] = 9
+    lag_history_quality: Optional[str] = "0/9 fallback (history accumulating)"
+
 
 
 class ContributingFactor(BaseModel):
@@ -1030,12 +1139,28 @@ def generate_autoregressive_forecast(
     hours: int = 72,
     static_weather: Optional[dict] = None,
     enable_feedback: bool = False,
-    simulation_mode: bool = False
-) -> List[ForecastHour]:
+    simulation_mode: bool = False,
+    station_name: Optional[str] = None
+) -> tuple[List[ForecastHour], int, int, str]:
     from backend.aerosol_feedback import apply_feedback
     
     forecast_list = []
     pm_history = [current_pm] * 25
+    real_count = 0
+    fallback_count = 9
+    quality_str = "0/9 fallback (accumulating live history)"
+
+    if station_name and not simulation_mode:
+        lag_dict, real_count, fallback_count, quality_str = get_station_accumulated_lags(
+            station_name, current_pm, now_utc
+        )
+        # Populate historical slots in pm_history
+        pm_history[23] = lag_dict["pm25_lag_1"]
+        pm_history[21] = lag_dict["pm25_lag_3"]
+        pm_history[18] = lag_dict["pm25_lag_6"]
+        pm_history[12] = lag_dict["pm25_lag_12"]
+        pm_history[0] = lag_dict["pm25_lag_24"]
+        pm_history[24] = current_pm
 
     for h in range(1, hours + 1):
         fc_time = now_utc + timedelta(hours=h)
@@ -1113,34 +1238,38 @@ def generate_autoregressive_forecast(
                 "day": day_val,
                 "month": month_val,
                 "day_of_week": dow_val,
-                "latitude": float(st_lat),
-                "longitude": float(st_lon)
+                "latitude": st_lat,
+                "longitude": st_lon
             }
-            input_df = pd.DataFrame([feature_row])[MODEL_FEATURES]
-            pred_val = round(max(5.0, float(xgb_model.predict(input_df)[0])), 1)
+            df_input = pd.DataFrame([feature_row])[MODEL_FEATURES]
+            predicted_pm = max(0.0, float(xgb_model.predict(df_input)[0]))
         else:
             diurnal = math.sin(2 * math.pi * (hour_val - 8) / 24)
-            pred_val = round(max(5.0, current_pm * (1.0 + 0.25 * diurnal)), 1)
+            decay = math.exp(-0.02 * h)
+            predicted_pm = max(5.0, (current_pm * decay) + (25.0 * diurnal) + (10.0 * (1 - decay)))
 
-        pm_history.append(pred_val)
-        pred_aqi, aqi_cat = pm25_to_aqi(pred_val)
-        exp_low, exp_high, bucket_name, conf_note = get_confidence_bounds(pred_val)
+        predicted_pm_rounded = round(predicted_pm, 2)
+        pm_history.append(predicted_pm_rounded)
+
+        predicted_aqi_num, predicted_aqi_cat = pm25_to_aqi(predicted_pm_rounded)
+
+        # Calibrated Confidence Intervals via empirical residual distribution
+        exp_low, exp_high, u_bucket, conf_note = get_confidence_bounds(predicted_pm_rounded)
 
         forecast_list.append(
             ForecastHour(
                 hour_offset=h,
-                timestamp=fc_time.strftime("%Y-%m-%dT%H:00:00Z"),
-                predicted_pm25=pred_val,
-                predicted_aqi=pred_aqi,
-                unit="µg/m³",
-                aqi_category=aqi_cat,
+                timestamp=fc_time.isoformat(),
+                predicted_pm25=predicted_pm_rounded,
+                predicted_aqi=predicted_aqi_num,
+                aqi_category=predicted_aqi_cat,
                 expected_low=exp_low,
                 expected_high=exp_high,
-                uncertainty_bucket=bucket_name,
+                uncertainty_bucket=u_bucket,
                 confidence_note=conf_note
             )
         )
-    return forecast_list
+    return forecast_list, real_count, fallback_count, quality_str
 
 
 class SimulationRequest(BaseModel):
@@ -1174,7 +1303,7 @@ def simulate_scenario(req: SimulationRequest):
         "precipitation": req.precipitation
     }
     
-    baseline = generate_autoregressive_forecast(
+    baseline, *_ = generate_autoregressive_forecast(
         current_pm=req.pm25,
         now_utc=now_utc,
         is_using_real_model=(xgb_model is not None),
@@ -1187,7 +1316,7 @@ def simulate_scenario(req: SimulationRequest):
         simulation_mode=True
     )
     
-    feedback = generate_autoregressive_forecast(
+    feedback, *_ = generate_autoregressive_forecast(
         current_pm=req.pm25,
         now_utc=now_utc,
         is_using_real_model=(xgb_model is not None),
@@ -1213,19 +1342,19 @@ def get_forecast_for_station(station_name: str):
     """
     Generates a 72-hour forecast for the station using the trained XGBoost model,
     real Open-Meteo hour-by-hour forecast weather, and official CPCB AQI.
+    Uses accumulated live history for lag features where available, falling back safely.
     """
     decoded_name = urllib.parse.unquote(station_name).strip()
     actual_name, city, baseline_pm25, st_lat, st_lon = resolve_station_info(station_name)
 
     now_utc = datetime.now(timezone.utc)
-    forecast_list = []
     is_using_real_model = (xgb_model is not None)
     forecast_weather_df = load_forecast_weather()
 
     current_pm = max(5.0, baseline_pm25)
     current_aqi_num, current_aqi_cat = pm25_to_aqi(current_pm)
 
-    forecast_list = generate_autoregressive_forecast(
+    forecast_list, real_lags_count, fallback_lags_count, lag_quality = generate_autoregressive_forecast(
         current_pm=current_pm,
         now_utc=now_utc,
         is_using_real_model=is_using_real_model,
@@ -1234,7 +1363,9 @@ def get_forecast_for_station(station_name: str):
         st_lon=st_lon,
         hours=72,
         static_weather=None,
-        enable_feedback=False
+        enable_feedback=False,
+        simulation_mode=False,
+        station_name=actual_name
     )
 
     return ForecastResponse(
@@ -1247,7 +1378,10 @@ def get_forecast_for_station(station_name: str):
         current_aqi=current_aqi_num,
         current_aqi_category=current_aqi_cat,
         forecast_hours=72,
-        forecast=forecast_list
+        forecast=forecast_list,
+        real_lags_count=real_lags_count,
+        fallback_lags_count=fallback_lags_count,
+        lag_history_quality=lag_quality
     )
 
 
@@ -1264,7 +1398,8 @@ def explain_station_prediction(station_name: str):
         )
 
     try:
-        actual_name, city, current_pm, feature_df = extract_station_current_features(station_name)
+        actual_name, city, current_pm, feature_df, real_count, fb_count, qual = extract_station_current_features(station_name)
+
         
         # Compute prediction and SHAP values for single feature vector
         predicted_val = round(max(0.0, float(xgb_model.predict(feature_df)[0])), 2)
@@ -1348,7 +1483,7 @@ def get_dispersion_conditions(station_name: str):
     depth for the station based on real-time meteorological indicators.
     """
     try:
-        actual_name, city, current_pm, feature_df = extract_station_current_features(station_name)
+        actual_name, city, current_pm, feature_df, *_ = extract_station_current_features(station_name)
         
         wind_spd = float(feature_df.iloc[0]["wind_speed_10m"])
         blh = float(feature_df.iloc[0]["boundary_layer_height"])

@@ -207,9 +207,65 @@ def main():
     df_clean.to_csv(CSV_OUT, index=False)
     print(f"Active cleaned data saved ({len(df_clean)} rows) -> {CSV_OUT}")
 
+    # Accumulate into rolling live history log (openaq_live_history.csv)
+    LIVE_HISTORY_OUT = OUTPUT_DIR / "openaq_live_history.csv"
+    append_to_live_history(df_clean, LIVE_HISTORY_OUT)
+
     print("\nFirst 10 rows of cleaned data:")
     print(df_clean.head(10).to_string(index=False))
 
 
+def append_to_live_history(df_clean, live_history_path):
+    """
+    Appends active station PM2.5 readings to the accumulating live history log.
+    Enforces deduplication on (station_name, timestamp) and caps data at 35 days.
+    """
+    if df_clean.empty or "parameter" not in df_clean.columns:
+        return
+    
+    pm25_mask = df_clean["parameter"].astype(str).str.lower().isin(["pm25", "pm2.5", "pm2_5"])
+    pm_df = df_clean[pm25_mask & df_clean["value"].notna()].copy()
+    if pm_df.empty:
+        return
+
+    new_rows = pd.DataFrame({
+        "station_name": pm_df["location"].astype(str).str.strip(),
+        "timestamp": pm_df["timestamp"].astype(str).str.strip(),
+        "pm25_value": pm_df["value"].astype(float).round(2)
+    })
+    new_rows = new_rows[(new_rows["timestamp"] != "") & (new_rows["pm25_value"] >= 0)]
+    if new_rows.empty:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_time = now_utc - pd.Timedelta(days=35)
+
+    if live_history_path.exists():
+        try:
+            existing_df = pd.read_csv(live_history_path)
+            if not all(col in existing_df.columns for col in ["station_name", "timestamp", "pm25_value"]):
+                existing_df = pd.DataFrame(columns=["station_name", "timestamp", "pm25_value"])
+        except Exception:
+            existing_df = pd.DataFrame(columns=["station_name", "timestamp", "pm25_value"])
+    else:
+        existing_df = pd.DataFrame(columns=["station_name", "timestamp", "pm25_value"])
+
+    combined = pd.concat([existing_df, new_rows], ignore_index=True)
+    combined["station_name"] = combined["station_name"].astype(str).str.strip()
+    combined["timestamp"] = combined["timestamp"].astype(str).str.strip()
+    combined = combined.drop_duplicates(subset=["station_name", "timestamp"], keep="last")
+
+    # Safety Cap: keep only last 35 days
+    combined["dt_temp"] = pd.to_datetime(combined["timestamp"], errors="coerce", utc=True)
+    valid_mask = combined["dt_temp"].notna() & (combined["dt_temp"] >= cutoff_time)
+    combined_capped = combined[valid_mask].sort_values("dt_temp").drop(columns=["dt_temp"]).reset_index(drop=True)
+
+    temp_path = live_history_path.with_suffix(".tmp")
+    combined_capped.to_csv(temp_path, index=False)
+    temp_path.replace(live_history_path)
+    print(f"Accumulated live history updated -> {live_history_path} ({len(combined_capped)} total rows, +{len(new_rows)} new/checked)")
+
+
 if __name__ == "__main__":
     main()
+
