@@ -599,9 +599,6 @@ We thank the organizations and open-data communities that make these datasets an
 ## Team
 
 **Team Vayu Vision**
-## Team
-
-**Team Vayu Vision**
 
 * **Team Lead:** Gogga Pradeep
 * **Bantu Tanu Sri**
