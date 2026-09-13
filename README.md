@@ -611,9 +611,6 @@ We thank the organizations and open-data communities that make these datasets an
 **SIH Problem Statement:** SIH26082
 
 
-**Project:** VayuDrishti
-**SIH Problem Statement:** SIH26082
-
 ---
 
 ## License
