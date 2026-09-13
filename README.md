@@ -621,7 +621,6 @@ We thank the organizations and open-data communities that make these datasets an
 
 ## License
 
-## License
 
 No open-source license has been selected for this project at this time.
 
