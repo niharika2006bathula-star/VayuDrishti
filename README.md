@@ -599,6 +599,20 @@ We thank the organizations and open-data communities that make these datasets an
 ## Team
 
 **Team Vayu Vision**
+## Team
+
+**Team Vayu Vision**
+
+* **Team Lead:** Gogga Pradeep
+* **Bantu Tanu Sri**
+* **Bathula Niharika**
+* **Nenavath Savitha**
+* **K.Raghavendra**
+* **Shaik Yasar Arafath**
+
+**Project:** VayuDrishti
+**SIH Problem Statement:** SIH26082
+
 
 **Project:** VayuDrishti
 **SIH Problem Statement:** SIH26082
